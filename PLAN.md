@@ -84,7 +84,44 @@ Use proper NetworkManager scan completion:
 5. Add a timeout fallback, e.g. 12 seconds.
 6. Print the refreshed list.
 
-Important: NetworkManager still does not provide percentage progress. We can only report start/finish or elapsed time.
+Important: NetworkManager does not provide percentage progress. We can report scan state, elapsed time, retry state, completion, and the number/list of access points discovered so far.
+
+### 6a. Live scan/progress mode
+
+A key goal is to update the displayed network list while scanning, instead of only replacing it after scan completion.
+
+Add a streaming scan mode:
+
+```bash
+nm-wifi-rofi scan --stream --timeout 12 --retries 2
+```
+
+Behavior:
+
+1. Emit an immediate snapshot of the currently cached NetworkManager access-point list.
+2. Register D-Bus signal watchers before requesting the scan:
+   - `org.freedesktop.NetworkManager.Device.Wireless.AccessPointAdded`
+   - `org.freedesktop.NetworkManager.Device.Wireless.AccessPointRemoved`
+   - `org.freedesktop.DBus.Properties.PropertiesChanged` for `LastScan`
+3. Call `RequestScan({})`.
+4. Whenever access points are added/removed, rebuild/deduplicate/sort the list and emit a new snapshot immediately.
+5. When `LastScan` changes, emit a final snapshot and a completion event.
+6. If `RequestScan` is rejected, rate-limited, or times out, keep emitting the cached/latest list and report an informative warning instead of leaving the user with an empty menu.
+7. Retry scan requests with bounded backoff while the UI remains usable:
+   - 1s
+   - 2s
+   - 4s
+   - 8s max
+8. Keep machine-readable stream output separate from legacy TSV output. Use JSON Lines for stream events, e.g.:
+
+```jsonl
+{"event":"status","message":"requested scan on wlan0"}
+{"event":"snapshot","scanning":true,"networks_found":3,"networks":[...]}
+{"event":"warning","message":"scan request failed; retrying in 2s"}
+{"event":"complete","timed_out":false,"networks_found":18}
+```
+
+Rofi note: plain rofi script mode usually consumes one command output at a time. The backend should still expose live JSONL snapshots first; the rofi integration can then either refresh from cached snapshots, use a helper process, or implement a controlled refresh loop.
 
 ## 7. Parallel integration strategy
 
