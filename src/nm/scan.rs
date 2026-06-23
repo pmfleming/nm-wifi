@@ -41,6 +41,13 @@ impl Nm {
             .context("RequestScan")
     }
 
+    pub(super) fn request_hidden_scan(&self, device: &WifiDevice, ssid: &str) -> Result<()> {
+        let wifi = self.proxy_path(&device.path, WIFI_IFACE)?;
+        let options = HashMap::from([("ssids", Value::new(vec![ssid.as_bytes().to_vec()]))]);
+        wifi.call::<_, _, ()>("RequestScan", &(options,))
+            .with_context(|| format!("RequestScan hidden SSID on {}", device.iface))
+    }
+
     pub(crate) fn last_scan(&self, device: &WifiDevice) -> i64 {
         self.proxy_path(&device.path, WIFI_IFACE)
             .and_then(|wifi| wifi.get_property("LastScan").context("read LastScan"))

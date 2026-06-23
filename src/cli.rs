@@ -44,6 +44,12 @@ pub(crate) enum Command {
         /// Password for creating a new WPA/WPA2/WPA3-Personal connection over D-Bus.
         #[arg(long)]
         password: Option<String>,
+        /// Restrict connection to a visible BSSID.
+        #[arg(long)]
+        bssid: Option<String>,
+        /// Treat the SSID as hidden and request a targeted scan before connecting.
+        #[arg(long)]
+        hidden: bool,
     },
     /// Emit a rofi script-mode menu backed by cached live-scan snapshots.
     Rofi {

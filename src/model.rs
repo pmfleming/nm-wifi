@@ -25,6 +25,25 @@ pub(crate) struct WifiDevice {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct WifiConnectTarget {
+    pub(crate) ssid: String,
+    pub(crate) ap_path: Option<String>,
+    pub(crate) bssid: Option<String>,
+    pub(crate) hidden: bool,
+}
+
+impl WifiConnectTarget {
+    pub(crate) fn visible(ssid: impl Into<String>) -> Self {
+        Self {
+            ssid: ssid.into(),
+            ap_path: None,
+            bssid: None,
+            hidden: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct AccessPoint {
     pub(crate) ssid: String,
     pub(crate) active: bool,
@@ -33,6 +52,10 @@ pub(crate) struct AccessPoint {
     pub(crate) frequency: u32,
     pub(crate) bssid: String,
     pub(crate) last_seen: i32,
+    #[serde(default)]
+    pub(crate) path: String,
+    #[serde(default)]
+    pub(crate) device_path: String,
     #[serde(default)]
     pub(crate) flags: u32,
     #[serde(default)]

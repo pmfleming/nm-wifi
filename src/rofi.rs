@@ -5,13 +5,14 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result};
 
 use crate::cache::{self, CachedSnapshot};
-use crate::model::AccessPoint;
+use crate::model::{AccessPoint, WifiConnectTarget};
 use crate::nm::Nm;
 
 const ACTION_RESCAN: &str = "rescan";
 const ACTION_STATUS: &str = "status";
 const ACTION_SSID_PREFIX: &str = "ssid:";
 const ACTION_SSID_HEX_PREFIX: &str = "ssid-hex:";
+const ACTION_AP_HEX_PREFIX: &str = "ap-hex:";
 const ROFI_CUSTOM_RESCAN_OR_REFRESH: &str = "10";
 const ROFI_CUSTOM_AUTO_REFRESH: &str = "11";
 const STALE_SESSION_GRACE_SECS: u64 = 2;
@@ -58,19 +59,23 @@ fn request_background_scan(timeout: u64, retries: u32) -> Result<()> {
 }
 
 fn handle_network_action(nm: &Nm, action: &str) -> Result<()> {
-    let Some(ssid) = decode_ssid_action(action) else {
+    let Some(target) = decode_network_action(action) else {
         return Ok(());
     };
-    let password = if nm.needs_wifi_password(&ssid)? {
-        let Some(password) = prompt_wifi_password(&ssid)? else {
-            cache::write_status("canceled", format!("Connection canceled for {ssid}"))?;
+    let password = if nm.needs_wifi_password_for(&target)? {
+        let Some(password) = prompt_wifi_password(&target.ssid)? else {
+            cache::write_status(
+                "canceled",
+                format!("Connection canceled for {}", target.ssid),
+            )?;
             return Ok(());
         };
         Some(password)
     } else {
         None
     };
-    if let Err(err) = crate::connect::connect_ssid_with_password(nm, &ssid, password.as_deref()) {
+    if let Err(err) = crate::connect::connect_target_with_password(nm, &target, password.as_deref())
+    {
         eprintln!("warning: {err:#}");
     }
     Ok(())
@@ -200,7 +205,7 @@ fn print_network_row(ap: &AccessPoint) {
         ap.strength,
         clean_label(&ap.ssid)
     );
-    print_row(label, encode_ssid_action(&ap.ssid));
+    print_row(label, encode_ap_action(ap));
 }
 
 fn print_rofi_header() {
@@ -227,13 +232,38 @@ fn print_disabled_row(label: impl AsRef<str>, info: impl AsRef<str>) {
     );
 }
 
+fn encode_ap_action(ap: &AccessPoint) -> String {
+    encode_hex_action(
+        ACTION_AP_HEX_PREFIX,
+        &serde_json::to_vec(&WifiConnectTarget {
+            ssid: ap.ssid.clone(),
+            ap_path: (!ap.path.is_empty()).then(|| ap.path.clone()),
+            bssid: (!ap.bssid.is_empty()).then(|| ap.bssid.clone()),
+            hidden: false,
+        })
+        .unwrap_or_else(|_| ap.ssid.as_bytes().to_vec()),
+    )
+}
+
+#[cfg(test)]
 fn encode_ssid_action(ssid: &str) -> String {
-    let mut encoded = String::with_capacity(ACTION_SSID_HEX_PREFIX.len() + ssid.len() * 2);
-    encoded.push_str(ACTION_SSID_HEX_PREFIX);
-    for byte in ssid.as_bytes() {
+    encode_hex_action(ACTION_SSID_HEX_PREFIX, ssid.as_bytes())
+}
+
+fn encode_hex_action(prefix: &str, bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(prefix.len() + bytes.len() * 2);
+    encoded.push_str(prefix);
+    for byte in bytes {
         let _ = write!(encoded, "{byte:02x}");
     }
     encoded
+}
+
+fn decode_network_action(action: &str) -> Option<WifiConnectTarget> {
+    if let Some(encoded) = action.strip_prefix(ACTION_AP_HEX_PREFIX) {
+        return decode_hex(encoded).and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    }
+    decode_ssid_action(action).map(WifiConnectTarget::visible)
 }
 
 fn decode_ssid_action(action: &str) -> Option<String> {
@@ -270,9 +300,10 @@ fn clean_label(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTION_SSID_HEX_PREFIX, ACTION_SSID_PREFIX, clean_label, decode_ssid_action,
-        encode_ssid_action,
+        ACTION_AP_HEX_PREFIX, ACTION_SSID_HEX_PREFIX, ACTION_SSID_PREFIX, clean_label,
+        decode_network_action, decode_ssid_action, encode_ap_action, encode_ssid_action,
     };
+    use crate::model::AccessPoint;
 
     #[test]
     fn ssid_action_encoding_round_trips_protocol_characters() {
@@ -281,6 +312,31 @@ mod tests {
 
         assert!(action.starts_with(ACTION_SSID_HEX_PREFIX));
         assert_eq!(decode_ssid_action(&action).as_deref(), Some(ssid));
+    }
+
+    #[test]
+    fn ap_action_encoding_carries_selected_ap_identity() {
+        let ap = AccessPoint {
+            ssid: "Cafe".to_string(),
+            active: false,
+            security: "WPA2/3".to_string(),
+            strength: 80,
+            frequency: 5180,
+            bssid: "00:11:22:33:44:55".to_string(),
+            last_seen: 0,
+            path: "/org/freedesktop/NetworkManager/AccessPoint/1".to_string(),
+            device_path: "/org/freedesktop/NetworkManager/Devices/1".to_string(),
+            flags: 0,
+            wpa_flags: 0,
+            rsn_flags: 0,
+        };
+        let action = encode_ap_action(&ap);
+        let target = decode_network_action(&action).expect("target");
+
+        assert!(action.starts_with(ACTION_AP_HEX_PREFIX));
+        assert_eq!(target.ssid, ap.ssid);
+        assert_eq!(target.ap_path.as_deref(), Some(ap.path.as_str()));
+        assert_eq!(target.bssid.as_deref(), Some(ap.bssid.as_str()));
     }
 
     #[test]

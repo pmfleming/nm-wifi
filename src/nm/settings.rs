@@ -6,27 +6,39 @@ use zvariant::{OwnedObjectPath, OwnedValue};
 use super::{
     ConnectionSettings, DEVICE_IFACE, Nm, SETTINGS_CONNECTION_IFACE, SETTINGS_IFACE, SETTINGS_PATH,
 };
-use crate::model::WifiDevice;
+use crate::model::{WifiConnectTarget, WifiDevice};
 
 impl Nm {
-    pub(super) fn saved_wifi_activation_target(
+    pub(super) fn saved_wifi_activation_target_for(
         &self,
-        ssid: &str,
+        target: &WifiConnectTarget,
     ) -> Result<Option<(OwnedObjectPath, OwnedObjectPath, OwnedObjectPath)>> {
-        if let Some((device, ap_path, _ap)) = self.visible_access_point(ssid)?
+        if !target.hidden
+            && let Some((device, ap_path, _ap)) = self.visible_access_point_for(
+                &target.ssid,
+                target.ap_path.as_deref(),
+                target.bssid.as_deref(),
+            )?
             && let Some(connection_path) =
-                self.saved_wifi_connection_for_ssid_on_device(ssid, &device)?
+                self.saved_wifi_connection_for_ssid_on_device(&target.ssid, &device)?
         {
             return Ok(Some((connection_path, device.path, ap_path)));
         }
 
-        let Some(connection_path) = self.saved_wifi_connection_for_ssid(ssid)? else {
+        let Some(connection_path) = self.saved_wifi_connection_for_ssid(&target.ssid)? else {
             return Ok(None);
         };
         let Some(device) = self.wifi_devices()?.into_iter().next() else {
             bail!("no Wi-Fi devices found");
         };
         Ok(Some((connection_path, device.path, root_object_path()?)))
+    }
+
+    pub(crate) fn delete_connection(&self, path: &OwnedObjectPath) -> Result<()> {
+        let connection = self.proxy_path(path, SETTINGS_CONNECTION_IFACE)?;
+        connection
+            .call::<_, _, ()>("Delete", &())
+            .with_context(|| format!("Delete connection {path}"))
     }
 
     fn saved_wifi_connection_for_ssid_on_device(

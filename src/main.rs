@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use crate::cli::{Cli, Command};
-use crate::model::ScanStreamOptions;
+use crate::model::{ScanStreamOptions, WifiConnectTarget};
 use crate::nm::Nm;
 use crate::output::{print_access_points, print_access_points_json};
 
@@ -30,9 +30,21 @@ fn main() -> Result<()> {
             retries,
             cache,
         } => run_scan(&nm, timeout, stream, strict, retries, cache)?,
-        Command::Connect { ssid, password } => {
-            connect::connect_ssid_with_password(&nm, &ssid, password.as_deref())?
-        }
+        Command::Connect {
+            ssid,
+            password,
+            bssid,
+            hidden,
+        } => connect::connect_target_with_password(
+            &nm,
+            &WifiConnectTarget {
+                ssid,
+                ap_path: None,
+                bssid,
+                hidden,
+            },
+            password.as_deref(),
+        )?,
         Command::Rofi {
             timeout,
             retries,

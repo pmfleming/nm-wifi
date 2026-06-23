@@ -37,22 +37,24 @@ impl Nm {
                 continue;
             };
             return self
-                .access_point(&active_path, true)
+                .access_point(&device.path, &active_path, true)
                 .map(|ap| Some(ap.ssid));
         }
         Ok(None)
     }
 
-    pub(super) fn visible_access_point(
+    pub(super) fn visible_access_point_for(
         &self,
         ssid: &str,
+        ap_path: Option<&str>,
+        bssid: Option<&str>,
     ) -> Result<Option<(WifiDevice, OwnedObjectPath, AccessPoint)>> {
         for device in self.wifi_devices()? {
             for path in self.device_access_points(&device)? {
-                let Ok(ap) = self.access_point(&path, false) else {
+                let Ok(ap) = self.access_point(&device.path, &path, false) else {
                     continue;
                 };
-                if ap.ssid == ssid {
+                if access_point_matches(&ap, ssid, ap_path, bssid) {
                     return Ok(Some((device, path, ap)));
                 }
             }
@@ -76,7 +78,7 @@ impl Nm {
         let active_path = self.active_access_point(device)?;
         for path in self.device_access_points(device)? {
             let active = active_path.as_ref().is_some_and(|active| *active == path);
-            if let Some(ap) = self.read_visible_access_point(&path, active) {
+            if let Some(ap) = self.read_visible_access_point(&device.path, &path, active) {
                 merge_access_point(by_ssid, ap);
             }
         }
@@ -99,10 +101,11 @@ impl Nm {
 
     fn read_visible_access_point(
         &self,
+        device_path: &OwnedObjectPath,
         path: &OwnedObjectPath,
         active: bool,
     ) -> Option<AccessPoint> {
-        match self.access_point(path, active) {
+        match self.access_point(device_path, path, active) {
             Ok(ap) if !ap.ssid.is_empty() => Some(ap),
             Ok(_) => None,
             Err(err) => {
@@ -112,7 +115,12 @@ impl Nm {
         }
     }
 
-    fn access_point(&self, path: &OwnedObjectPath, active: bool) -> Result<AccessPoint> {
+    fn access_point(
+        &self,
+        device_path: &OwnedObjectPath,
+        path: &OwnedObjectPath,
+        active: bool,
+    ) -> Result<AccessPoint> {
         let ap = self.proxy_path(path, AP_IFACE)?;
         let ssid_bytes: Vec<u8> = ap
             .get_property("Ssid")
@@ -129,11 +137,31 @@ impl Nm {
             frequency: ap.get_property("Frequency").unwrap_or(0),
             bssid: ap.get_property("HwAddress").unwrap_or_default(),
             last_seen: ap.get_property("LastSeen").unwrap_or(-1),
+            path: path.to_string(),
+            device_path: device_path.to_string(),
             flags,
             wpa_flags,
             rsn_flags,
         })
     }
+}
+
+fn access_point_matches(
+    ap: &AccessPoint,
+    ssid: &str,
+    ap_path: Option<&str>,
+    bssid: Option<&str>,
+) -> bool {
+    if ap.ssid != ssid {
+        return false;
+    }
+    if let Some(ap_path) = ap_path.filter(|value| !value.is_empty()) {
+        return ap.path == ap_path;
+    }
+    if let Some(bssid) = bssid.filter(|value| !value.is_empty()) {
+        return ap.bssid.eq_ignore_ascii_case(bssid);
+    }
+    true
 }
 
 fn merge_access_point(by_ssid: &mut BTreeMap<String, AccessPoint>, ap: AccessPoint) {

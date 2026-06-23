@@ -1,18 +1,21 @@
 use std::collections::HashMap;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use zvariant::{DynamicType, OwnedObjectPath, OwnedValue, Value};
 
 use super::{ACTIVE_CONNECTION_IFACE, ConnectionSettings, DEVICE_IFACE, NM_IFACE, NM_PATH, Nm};
 use crate::model::{
-    AccessPoint, NM_AP_SEC_KEY_MGMT_PSK, NM_AP_SEC_KEY_MGMT_SAE, ap_is_passwordless,
-    ap_supports_psk,
+    AccessPoint, NM_AP_SEC_KEY_MGMT_PSK, NM_AP_SEC_KEY_MGMT_SAE, WifiConnectTarget,
+    ap_is_passwordless, ap_supports_psk,
 };
 
 impl Nm {
-    pub(crate) fn activate_saved_wifi_connection(&self, ssid: &str) -> Result<bool> {
+    pub(crate) fn activate_saved_wifi_connection_for(
+        &self,
+        target: &WifiConnectTarget,
+    ) -> Result<bool> {
         let Some((connection_path, device_path, specific_object)) =
-            self.saved_wifi_activation_target(ssid)?
+            self.saved_wifi_activation_target_for(target)?
         else {
             return Ok(false);
         };
@@ -22,55 +25,103 @@ impl Nm {
                 "ActivateConnection",
                 &(connection_path, device_path, specific_object),
             )
-            .with_context(|| format!("ActivateConnection for saved Wi-Fi profile {ssid}"))?;
+            .with_context(|| {
+                format!("ActivateConnection for saved Wi-Fi profile {}", target.ssid)
+            })?;
         Ok(true)
     }
 
-    pub(crate) fn add_and_activate_wifi_connection(
+    pub(crate) fn add_and_activate_wifi_connection_for(
         &self,
-        ssid: &str,
+        target: &WifiConnectTarget,
         password: Option<&str>,
-    ) -> Result<bool> {
-        let Some((device, ap_path, ap)) = self.visible_access_point(ssid)? else {
-            return Ok(false);
+    ) -> Result<Option<OwnedObjectPath>> {
+        if target.hidden {
+            return self.add_and_activate_hidden_wifi_connection(target, password);
+        }
+
+        let Some((device, ap_path, ap)) = self.visible_access_point_for(
+            &target.ssid,
+            target.ap_path.as_deref(),
+            target.bssid.as_deref(),
+        )?
+        else {
+            return Ok(None);
         };
         let settings = if ap_is_passwordless(ap.flags, ap.wpa_flags, ap.rsn_flags) {
             ConnectionSettings::new()
         } else if ap_supports_psk(ap.wpa_flags, ap.rsn_flags) {
             let Some(password) = password else {
-                return Ok(false);
+                return Ok(None);
             };
             psk_wifi_connection_settings(&ap, password)?
         } else {
-            return Ok(false);
+            return Ok(None);
         };
 
-        let nm = self.proxy(NM_PATH, NM_IFACE)?;
-        let _paths: (OwnedObjectPath, OwnedObjectPath) = nm
-            .call(
-                "AddAndActivateConnection",
-                &(settings, device.path, ap_path),
-            )
-            .with_context(|| format!("AddAndActivateConnection for Wi-Fi network {ssid}"))?;
-        Ok(true)
+        self.add_and_activate(&target.ssid, settings, device.path, ap_path)
+            .map(Some)
     }
 
-    pub(crate) fn needs_wifi_password(&self, ssid: &str) -> Result<bool> {
-        if self.saved_wifi_activation_target(ssid)?.is_some() {
+    fn add_and_activate_hidden_wifi_connection(
+        &self,
+        target: &WifiConnectTarget,
+        password: Option<&str>,
+    ) -> Result<Option<OwnedObjectPath>> {
+        let Some(device) = self.wifi_devices()?.into_iter().next() else {
+            return Ok(None);
+        };
+        self.request_hidden_scan(&device, &target.ssid)?;
+        let settings = hidden_wifi_connection_settings(&target.ssid, password)?;
+        self.add_and_activate(&target.ssid, settings, device.path, root_object_path()?)
+            .map(Some)
+    }
+
+    fn add_and_activate(
+        &self,
+        ssid: &str,
+        settings: ConnectionSettings,
+        device_path: OwnedObjectPath,
+        specific_object: OwnedObjectPath,
+    ) -> Result<OwnedObjectPath> {
+        let nm = self.proxy(NM_PATH, NM_IFACE)?;
+        let (connection_path, _active_path): (OwnedObjectPath, OwnedObjectPath) = nm
+            .call(
+                "AddAndActivateConnection",
+                &(settings, device_path, specific_object),
+            )
+            .with_context(|| format!("AddAndActivateConnection for Wi-Fi network {ssid}"))?;
+        Ok(connection_path)
+    }
+
+    pub(crate) fn needs_wifi_password_for(&self, target: &WifiConnectTarget) -> Result<bool> {
+        if self.saved_wifi_activation_target_for(target)?.is_some() {
             return Ok(false);
         }
-        let Some((_device, _ap_path, ap)) = self.visible_access_point(ssid)? else {
+        if target.hidden {
+            return Ok(false);
+        }
+        let Some((_device, _ap_path, ap)) = self.visible_access_point_for(
+            &target.ssid,
+            target.ap_path.as_deref(),
+            target.bssid.as_deref(),
+        )?
+        else {
             return Ok(false);
         };
         Ok(!ap_is_passwordless(ap.flags, ap.wpa_flags, ap.rsn_flags)
             && ap_supports_psk(ap.wpa_flags, ap.rsn_flags))
     }
 
-    pub(crate) fn wifi_activation_status(
+    pub(crate) fn wifi_activation_status_for(
         &self,
-        ssid: &str,
+        target: &WifiConnectTarget,
     ) -> Result<Option<super::WifiActivationStatus>> {
-        let device = if let Some((device, _ap_path, _ap)) = self.visible_access_point(ssid)? {
+        let device = if let Some((device, _ap_path, _ap)) = self.visible_access_point_for(
+            &target.ssid,
+            target.ap_path.as_deref(),
+            target.bssid.as_deref(),
+        )? {
             device
         } else {
             let Some(device) = self.wifi_devices()?.into_iter().next() else {
@@ -119,18 +170,79 @@ impl Nm {
 }
 
 fn psk_wifi_connection_settings(ap: &AccessPoint, password: &str) -> Result<ConnectionSettings> {
+    let key_mgmt = psk_key_mgmt(ap);
+    if key_mgmt == "wpa-psk" {
+        validate_wpa_psk(password)?;
+    }
+    wireless_security_settings(key_mgmt, password)
+}
+
+fn hidden_wifi_connection_settings(
+    ssid: &str,
+    password: Option<&str>,
+) -> Result<ConnectionSettings> {
+    let mut settings = base_wifi_connection_settings(ssid, true)?;
+    if let Some(password) = password {
+        validate_wpa_psk(password)?;
+        settings.insert(
+            "802-11-wireless-security".to_string(),
+            wireless_security_section("wpa-psk", password)?,
+        );
+    }
+    Ok(settings)
+}
+
+fn base_wifi_connection_settings(ssid: &str, hidden: bool) -> Result<ConnectionSettings> {
+    let mut settings = ConnectionSettings::new();
+    settings.insert(
+        "connection".to_string(),
+        HashMap::from([
+            ("id".to_string(), owned_value(ssid.to_string())?),
+            (
+                "type".to_string(),
+                owned_value("802-11-wireless".to_string())?,
+            ),
+        ]),
+    );
+    settings.insert(
+        "802-11-wireless".to_string(),
+        HashMap::from([
+            ("ssid".to_string(), owned_value(ssid.as_bytes().to_vec())?),
+            (
+                "mode".to_string(),
+                owned_value("infrastructure".to_string())?,
+            ),
+            ("hidden".to_string(), owned_value(hidden)?),
+        ]),
+    );
+    settings.insert(
+        "ipv4".to_string(),
+        HashMap::from([("method".to_string(), owned_value("auto".to_string())?)]),
+    );
+    settings.insert(
+        "ipv6".to_string(),
+        HashMap::from([("method".to_string(), owned_value("auto".to_string())?)]),
+    );
+    Ok(settings)
+}
+
+fn wireless_security_settings(key_mgmt: &str, password: &str) -> Result<ConnectionSettings> {
     let mut settings = ConnectionSettings::new();
     settings.insert(
         "802-11-wireless-security".to_string(),
-        HashMap::from([
-            (
-                "key-mgmt".to_string(),
-                owned_value(psk_key_mgmt(ap).to_string())?,
-            ),
-            ("psk".to_string(), owned_value(password.to_string())?),
-        ]),
+        wireless_security_section(key_mgmt, password)?,
     );
     Ok(settings)
+}
+
+fn wireless_security_section(
+    key_mgmt: &str,
+    password: &str,
+) -> Result<HashMap<String, OwnedValue>> {
+    Ok(HashMap::from([
+        ("key-mgmt".to_string(), owned_value(key_mgmt.to_string())?),
+        ("psk".to_string(), owned_value(password.to_string())?),
+    ]))
 }
 
 fn psk_key_mgmt(ap: &AccessPoint) -> &'static str {
@@ -142,6 +254,14 @@ fn psk_key_mgmt(ap: &AccessPoint) -> &'static str {
     }
 }
 
+fn validate_wpa_psk(password: &str) -> Result<()> {
+    let len = password.len();
+    if (8..=63).contains(&len) || (len == 64 && password.chars().all(|ch| ch.is_ascii_hexdigit())) {
+        return Ok(());
+    }
+    bail!("WPA-PSK password must be 8-63 characters, or 64 hexadecimal characters")
+}
+
 fn owned_value<T>(value: T) -> Result<OwnedValue>
 where
     T: Into<Value<'static>> + DynamicType,
@@ -149,9 +269,13 @@ where
     OwnedValue::try_from(Value::new(value)).context("create D-Bus variant value")
 }
 
+fn root_object_path() -> Result<OwnedObjectPath> {
+    OwnedObjectPath::try_from("/").context("create root object path")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{psk_key_mgmt, psk_wifi_connection_settings};
+    use super::{psk_key_mgmt, psk_wifi_connection_settings, validate_wpa_psk};
     use crate::model::{AccessPoint, NM_AP_SEC_KEY_MGMT_PSK, NM_AP_SEC_KEY_MGMT_SAE};
 
     #[test]
@@ -184,6 +308,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wpa_psk_validation_matches_nmcli_shape() {
+        assert!(validate_wpa_psk("12345678").is_ok());
+        assert!(validate_wpa_psk(&"a".repeat(63)).is_ok());
+        assert!(validate_wpa_psk(&"a".repeat(64)).is_ok());
+        assert!(validate_wpa_psk("short").is_err());
+        assert!(validate_wpa_psk(&"g".repeat(64)).is_err());
+        assert!(validate_wpa_psk(&"a".repeat(65)).is_err());
+    }
+
     fn test_ap(rsn_flags: u32) -> AccessPoint {
         AccessPoint {
             ssid: "Example".to_string(),
@@ -193,6 +327,8 @@ mod tests {
             frequency: 2412,
             bssid: "00:11:22:33:44:55".to_string(),
             last_seen: 0,
+            path: "/ap".to_string(),
+            device_path: "/device".to_string(),
             flags: 0,
             wpa_flags: 0,
             rsn_flags,
