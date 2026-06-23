@@ -70,7 +70,7 @@ impl MessageKind {
 fn emit_empty_snapshot(scanning: bool, cache: bool) -> Result<usize> {
     let networks = Vec::new();
     if cache {
-        crate::cache::write_snapshot(scanning, &networks)?;
+        crate::cache::write_live_scan_snapshot(scanning, &networks)?;
     }
     emit_stream_event(&StreamOutput::Snapshot {
         scanning,
@@ -84,7 +84,7 @@ fn emit_snapshot(nm: &Nm, scanning: bool, cache: bool) -> Result<usize> {
     let networks = nm.list_access_points()?;
     let networks_found = networks.len();
     if cache {
-        crate::cache::write_snapshot(scanning, &networks)?;
+        crate::cache::write_live_scan_snapshot(scanning, &networks)?;
     }
     emit_stream_event(&StreamOutput::Snapshot {
         scanning,

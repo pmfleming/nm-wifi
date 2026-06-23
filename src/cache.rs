@@ -9,7 +9,7 @@ use crate::model::AccessPoint;
 
 const CACHE_VERSION: u32 = 1;
 const CACHE_DIR_NAME: &str = "nm-wifi-rofi";
-const REVEAL_INTERVAL_MS: u128 = 700;
+const REVEAL_INTERVAL_MS: u128 = 10;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct CachedSnapshot {
@@ -102,11 +102,6 @@ pub(crate) fn visible_network_count(
     Ok(visible_count)
 }
 
-pub(crate) fn progressive_reveal_active(scanning: bool, available: usize) -> Result<bool> {
-    Ok(read_reveal()?
-        .is_some_and(|reveal| reveal.active && (scanning || reveal.visible_count < available)))
-}
-
 fn should_reveal_next(reveal: &RevealState, available: usize) -> bool {
     available > reveal.visible_count
         && (reveal.visible_count == 0
@@ -114,7 +109,15 @@ fn should_reveal_next(reveal: &RevealState, available: usize) -> bool {
 }
 
 pub(crate) fn write_empty_scanning_snapshot() -> Result<()> {
-    write_snapshot(true, &[])
+    write_session_snapshot(true, &[])
+}
+
+pub(crate) fn write_live_scan_snapshot(scanning: bool, networks: &[AccessPoint]) -> Result<()> {
+    if scanning {
+        return write_session_snapshot(true, networks);
+    }
+    write_snapshot(false, networks)?;
+    write_session_snapshot(false, networks)
 }
 
 pub(crate) fn write_snapshot(scanning: bool, networks: &[AccessPoint]) -> Result<()> {
@@ -159,12 +162,27 @@ pub(crate) fn read_snapshot() -> Result<Option<CachedSnapshot>> {
     read_json(snapshot_path())
 }
 
+pub(crate) fn read_session_snapshot() -> Result<Option<CachedSnapshot>> {
+    read_json(session_path())
+}
+
 pub(crate) fn read_status() -> Result<Option<CachedStatus>> {
     read_json(status_path())
 }
 
 fn read_reveal() -> Result<Option<RevealState>> {
     read_json(reveal_path())
+}
+
+fn write_session_snapshot(scanning: bool, networks: &[AccessPoint]) -> Result<()> {
+    let snapshot = CachedSnapshot {
+        version: CACHE_VERSION,
+        updated_at_ms: now_ms(),
+        scanning,
+        networks_found: networks.len(),
+        networks: networks.to_vec(),
+    };
+    write_json(session_path(), &snapshot)
 }
 
 fn write_status_record(status: CachedStatus) -> Result<()> {
@@ -204,6 +222,10 @@ fn snapshot_path() -> PathBuf {
 
 fn status_path() -> PathBuf {
     cache_dir().join("status.json")
+}
+
+fn session_path() -> PathBuf {
+    cache_dir().join("scan-session.json")
 }
 
 fn reveal_path() -> PathBuf {
