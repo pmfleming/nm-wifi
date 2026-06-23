@@ -11,6 +11,7 @@ const ACTION_RESCAN: &str = "rescan";
 const ACTION_STATUS: &str = "status";
 const ACTION_SSID_PREFIX: &str = "ssid:";
 const ROFI_CUSTOM_RESCAN_OR_REFRESH: &str = "10";
+const ROFI_CUSTOM_AUTO_REFRESH: &str = "11";
 
 pub(crate) fn run(nm: &Nm, timeout: u64, retries: u32) -> Result<()> {
     handle_action(nm, timeout, retries)?;
@@ -18,8 +19,10 @@ pub(crate) fn run(nm: &Nm, timeout: u64, retries: u32) -> Result<()> {
 }
 
 fn handle_action(nm: &Nm, timeout: u64, retries: u32) -> Result<()> {
-    if is_custom_rescan_or_refresh() {
-        return handle_rescan_hotkey(timeout, retries);
+    match rofi_return_code().as_deref() {
+        Some(ROFI_CUSTOM_RESCAN_OR_REFRESH) => return handle_rescan_hotkey(timeout, retries),
+        Some(ROFI_CUSTOM_AUTO_REFRESH) => return Ok(()),
+        _ => {}
     }
 
     match selected_action().as_deref() {
@@ -29,8 +32,8 @@ fn handle_action(nm: &Nm, timeout: u64, retries: u32) -> Result<()> {
     }
 }
 
-fn is_custom_rescan_or_refresh() -> bool {
-    env::var("ROFI_RETV").as_deref() == Ok(ROFI_CUSTOM_RESCAN_OR_REFRESH)
+fn rofi_return_code() -> Option<String> {
+    env::var("ROFI_RETV").ok()
 }
 
 fn handle_rescan_hotkey(timeout: u64, retries: u32) -> Result<()> {

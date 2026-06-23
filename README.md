@@ -17,7 +17,7 @@ nm-wifi-rofi rofi
 nm-wifi-rofi active
 ```
 
-`scan --stream` emits JSON Lines progress events and repeated snapshots as NetworkManager adds/removes access points. Add `--cache` to write `latest.json` and `status.json` under `$XDG_RUNTIME_DIR/nm-wifi-rofi`. Plain `scan` keeps TSV output and falls back to cached NetworkManager results with a stderr warning unless `--strict` is used. `rofi` emits an initial script-mode menu backed by cached snapshots, starts a background cached scan when the rescan row is selected, supports progressive refresh while scanning via the refresh/status row or custom hotkey, and uses the current `nmcli` fallback for connection activation.
+`scan --stream` emits JSON Lines progress events and repeated snapshots as NetworkManager adds/removes access points. Add `--cache` to write `latest.json` and `status.json` under `$XDG_RUNTIME_DIR/nm-wifi-rofi`. Plain `scan` keeps TSV output and falls back to cached NetworkManager results with a stderr warning unless `--strict` is used. `rofi` emits an initial script-mode menu backed by cached snapshots, starts a background cached scan when the rescan row is selected, clears the cached list for progressive repopulation, refreshes while scanning via rofi custom callbacks, and uses the current `nmcli` fallback for connection activation.
 
 Development:
 
