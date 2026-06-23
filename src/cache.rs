@@ -49,6 +49,10 @@ impl CachedStatus {
     }
 }
 
+pub(crate) fn write_empty_scanning_snapshot() -> Result<()> {
+    write_snapshot(true, &[])
+}
+
 pub(crate) fn write_snapshot(scanning: bool, networks: &[AccessPoint]) -> Result<()> {
     let snapshot = CachedSnapshot {
         version: CACHE_VERSION,

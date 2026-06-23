@@ -18,7 +18,7 @@ impl Nm {
 
         let rx = spawn_device_watchers(self.connection(), &devices);
         emit_status("preparing scan watchers", options.cache)?;
-        emit_snapshot(self, true, options.cache)?;
+        emit_empty_snapshot(true, options.cache)?;
         drain_watcher_startup(
             &rx,
             devices.len() * watcher_count_per_device(),
@@ -65,6 +65,19 @@ impl MessageKind {
             MessageKind::Warning => StreamOutput::Warning { message },
         }
     }
+}
+
+fn emit_empty_snapshot(scanning: bool, cache: bool) -> Result<usize> {
+    let networks = Vec::new();
+    if cache {
+        crate::cache::write_snapshot(scanning, &networks)?;
+    }
+    emit_stream_event(&StreamOutput::Snapshot {
+        scanning,
+        networks_found: 0,
+        networks: &networks,
+    })?;
+    Ok(0)
 }
 
 fn emit_snapshot(nm: &Nm, scanning: bool, cache: bool) -> Result<usize> {

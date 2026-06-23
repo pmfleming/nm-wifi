@@ -10,6 +10,7 @@ use crate::nm::Nm;
 const ACTION_RESCAN: &str = "rescan";
 const ACTION_STATUS: &str = "status";
 const ACTION_SSID_PREFIX: &str = "ssid:";
+const ROFI_CUSTOM_RESCAN_OR_REFRESH: &str = "10";
 
 pub(crate) fn run(nm: &Nm, timeout: u64, retries: u32) -> Result<()> {
     handle_action(nm, timeout, retries)?;
@@ -17,6 +18,10 @@ pub(crate) fn run(nm: &Nm, timeout: u64, retries: u32) -> Result<()> {
 }
 
 fn handle_action(nm: &Nm, timeout: u64, retries: u32) -> Result<()> {
+    if is_custom_rescan_or_refresh() {
+        return handle_rescan_hotkey(timeout, retries);
+    }
+
     match selected_action().as_deref() {
         Some(ACTION_RESCAN) => request_background_scan(timeout, retries),
         Some(ACTION_STATUS) | None => Ok(()),
@@ -24,13 +29,25 @@ fn handle_action(nm: &Nm, timeout: u64, retries: u32) -> Result<()> {
     }
 }
 
+fn is_custom_rescan_or_refresh() -> bool {
+    env::var("ROFI_RETV").as_deref() == Ok(ROFI_CUSTOM_RESCAN_OR_REFRESH)
+}
+
+fn handle_rescan_hotkey(timeout: u64, retries: u32) -> Result<()> {
+    if cache::read_snapshot()?.is_some_and(|snapshot| snapshot.scanning()) {
+        return Ok(());
+    }
+    request_background_scan(timeout, retries)
+}
+
 fn selected_action() -> Option<String> {
     env::var("ROFI_INFO").ok().filter(|value| !value.is_empty())
 }
 
 fn request_background_scan(timeout: u64, retries: u32) -> Result<()> {
-    start_background_scan(timeout, retries)?;
-    cache::write_status("status", "scan requested in background")
+    cache::write_empty_scanning_snapshot()?;
+    cache::write_status("scanning", "Scanning… 0 networks found")?;
+    start_background_scan(timeout, retries)
 }
 
 fn handle_network_action(nm: &Nm, action: &str) -> Result<()> {
@@ -66,43 +83,54 @@ fn start_background_scan(timeout: u64, retries: u32) -> Result<()> {
 
 fn emit_menu(nm: &Nm) -> Result<()> {
     print_rofi_header();
-    print_row(" Rescan", ACTION_RESCAN);
-    print_status_row()?;
+    let snapshot = cache::read_snapshot()?;
+    print_rescan_row(snapshot.as_ref());
+    if snapshot
+        .as_ref()
+        .is_none_or(|snapshot| !snapshot.scanning())
+    {
+        print_status_row(snapshot.as_ref())?;
+    }
 
-    for ap in menu_networks(nm)? {
+    for ap in menu_networks(nm, snapshot)? {
         print_network_row(&ap);
     }
     Ok(())
 }
 
-fn menu_networks(nm: &Nm) -> Result<Vec<AccessPoint>> {
-    if let Some(snapshot) = cache::read_snapshot()? {
+fn print_rescan_row(snapshot: Option<&CachedSnapshot>) {
+    match snapshot.filter(|snapshot| snapshot.scanning()) {
+        Some(snapshot) => print_disabled_row(scan_progress_label(snapshot), ACTION_STATUS),
+        None => print_row(" Rescan", ACTION_RESCAN),
+    }
+}
+
+fn scan_progress_label(snapshot: &CachedSnapshot) -> String {
+    format!(
+        " Scanning… {} networks found — Alt+R refreshes",
+        snapshot.networks_found()
+    )
+}
+
+fn menu_networks(nm: &Nm, snapshot: Option<CachedSnapshot>) -> Result<Vec<AccessPoint>> {
+    if let Some(snapshot) = snapshot {
         return Ok(snapshot.into_networks());
     }
     nm.list_access_points()
 }
 
-fn print_status_row() -> Result<()> {
+fn print_status_row(snapshot: Option<&CachedSnapshot>) -> Result<()> {
     if let Some(status) = cache::read_status()? {
-        print_row(clean_label(status.message()), "status");
-    } else if let Some(snapshot) = cache::read_snapshot()? {
-        print_snapshot_status(&snapshot);
+        print_row(clean_label(status.message()), ACTION_STATUS);
+    } else if let Some(snapshot) = snapshot {
+        print_row(
+            format!("Cached: {} networks", snapshot.networks_found()),
+            ACTION_STATUS,
+        );
     } else {
-        print_row("No cached scan yet", "status");
+        print_row("No cached scan yet", ACTION_STATUS);
     }
     Ok(())
-}
-
-fn print_snapshot_status(snapshot: &CachedSnapshot) {
-    let state = if snapshot.scanning() {
-        "Scanning"
-    } else {
-        "Cached"
-    };
-    print_row(
-        format!("{state}: {} networks", snapshot.networks_found()),
-        "status",
-    );
 }
 
 fn print_network_row(ap: &AccessPoint) {
@@ -119,10 +147,21 @@ fn print_network_row(ap: &AccessPoint) {
 fn print_rofi_header() {
     println!("\0prompt\x1fWi-Fi");
     println!("\0no-custom\x1ftrue");
+    println!("\0use-hot-keys\x1ftrue");
+    println!("\0keep-selection\x1ftrue");
+    println!("\0keep-filter\x1ftrue");
 }
 
 fn print_row(label: impl AsRef<str>, info: impl AsRef<str>) {
     println!("{}\0info\x1f{}", label.as_ref(), info.as_ref());
+}
+
+fn print_disabled_row(label: impl AsRef<str>, info: impl AsRef<str>) {
+    println!(
+        "{}\0info\x1f{}\x1fnonselectable\x1ftrue",
+        label.as_ref(),
+        info.as_ref()
+    );
 }
 
 fn clean_label(value: &str) -> String {
