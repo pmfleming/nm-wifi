@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,41 @@ pub(crate) struct ScanStreamOptions {
     pub(crate) timeout: Duration,
     pub(crate) retries: u32,
     pub(crate) cache: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ConnectResult {
+    pub(crate) status: &'static str,
+    pub(crate) ssid: String,
+    pub(crate) message: String,
+    pub(crate) connectivity: Option<ConnectivityStatus>,
+    pub(crate) suggest_open_portal: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ConnectivityStatus {
+    pub(crate) code: u32,
+    pub(crate) state: &'static str,
+    pub(crate) captive_portal: bool,
+    pub(crate) full: bool,
+}
+
+impl ConnectivityStatus {
+    pub(crate) fn from_nm_code(code: u32) -> Self {
+        let state = match code {
+            1 => "none",
+            2 => "portal",
+            3 => "limited",
+            4 => "full",
+            _ => "unknown",
+        };
+        Self {
+            code,
+            state,
+            captive_portal: matches!(code, 2 | 3),
+            full: code == 4,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -47,27 +83,73 @@ pub(crate) struct WifiDevice {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub(crate) struct WifiConnectTarget {
+pub(crate) struct SavedWifiConnection {
+    pub(crate) path: String,
+    pub(crate) id: String,
+    /// Human-readable display form of the SSID. This may be lossy for non-UTF-8 SSIDs.
     pub(crate) ssid: String,
+    /// Exact SSID bytes used for identity/matching.
+    pub(crate) ssid_bytes: Vec<u8>,
+    pub(crate) autoconnect: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct WifiConnectTarget {
+    /// Human-readable display form of the SSID. This may be lossy for non-UTF-8 SSIDs.
+    pub(crate) ssid: String,
+    /// Exact SSID bytes used for identity/matching. Empty only for legacy cache/action records.
+    #[serde(default)]
+    pub(crate) ssid_bytes: Vec<u8>,
+    #[serde(alias = "path")]
     pub(crate) ap_path: Option<String>,
     pub(crate) bssid: Option<String>,
+    #[serde(default)]
     pub(crate) hidden: bool,
+    #[serde(default)]
+    pub(crate) security: Option<String>,
 }
 
 impl WifiConnectTarget {
-    pub(crate) fn visible(ssid: impl Into<String>) -> Self {
-        Self {
-            ssid: ssid.into(),
-            ap_path: None,
-            bssid: None,
-            hidden: false,
+    pub(crate) fn ssid_bytes(&self) -> Cow<'_, [u8]> {
+        if self.ssid_bytes.is_empty() {
+            Cow::Borrowed(self.ssid.as_bytes())
+        } else {
+            Cow::Borrowed(&self.ssid_bytes)
         }
+    }
+
+    pub(crate) fn has_specific_ap(&self) -> bool {
+        self.ap_path
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+            || self.bssid.as_deref().is_some_and(|value| !value.is_empty())
     }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct NetworkCapabilities {
+    pub(crate) can_connect: bool,
+    pub(crate) needs_password: bool,
+    pub(crate) can_forget: bool,
+    pub(crate) can_toggle_autoconnect: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct NetworkEntry {
+    #[serde(flatten)]
+    pub(crate) access_point: AccessPoint,
+    pub(crate) primary_profile: Option<SavedWifiConnection>,
+    pub(crate) profiles: Vec<SavedWifiConnection>,
+    pub(crate) capabilities: NetworkCapabilities,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct AccessPoint {
+    /// Human-readable display form of the SSID. This may be lossy for non-UTF-8 SSIDs.
     pub(crate) ssid: String,
+    /// Exact SSID bytes used for identity/matching. Empty only for legacy cache records.
+    #[serde(default)]
+    pub(crate) ssid_bytes: Vec<u8>,
     pub(crate) active: bool,
     pub(crate) security: String,
     pub(crate) strength: u8,
@@ -86,12 +168,82 @@ pub(crate) struct AccessPoint {
     pub(crate) rsn_flags: u32,
 }
 
+impl AccessPoint {
+    pub(crate) fn ssid_bytes(&self) -> Cow<'_, [u8]> {
+        if self.ssid_bytes.is_empty() {
+            Cow::Borrowed(self.ssid.as_bytes())
+        } else {
+            Cow::Borrowed(&self.ssid_bytes)
+        }
+    }
+}
+
+pub(crate) fn network_entries(
+    access_points: Vec<AccessPoint>,
+    profiles: &[SavedWifiConnection],
+) -> Vec<NetworkEntry> {
+    access_points
+        .into_iter()
+        .map(|access_point| network_entry(access_point, profiles))
+        .collect()
+}
+
+fn network_entry(access_point: AccessPoint, profiles: &[SavedWifiConnection]) -> NetworkEntry {
+    let profiles = profiles_for_access_point(&access_point, profiles);
+    let primary_profile = profiles.first().cloned();
+    let needs_password = primary_profile.is_none()
+        && !ap_is_passwordless(
+            access_point.flags,
+            access_point.wpa_flags,
+            access_point.rsn_flags,
+        )
+        && (ap_supports_psk(access_point.wpa_flags, access_point.rsn_flags)
+            || ap_uses_wep(
+                access_point.flags,
+                access_point.wpa_flags,
+                access_point.rsn_flags,
+            ));
+    let has_identity = !access_point.ssid_bytes().is_empty();
+    let has_profile = primary_profile.is_some();
+    NetworkEntry {
+        access_point,
+        primary_profile,
+        capabilities: NetworkCapabilities {
+            can_connect: has_identity && (!needs_password || has_profile),
+            needs_password,
+            can_forget: has_profile,
+            can_toggle_autoconnect: has_profile,
+        },
+        profiles,
+    }
+}
+
+fn profiles_for_access_point(
+    access_point: &AccessPoint,
+    profiles: &[SavedWifiConnection],
+) -> Vec<SavedWifiConnection> {
+    let ap_ssid = access_point.ssid_bytes();
+    profiles
+        .iter()
+        .filter(|profile| ssid_matches(ap_ssid.as_ref(), &profile.ssid_bytes))
+        .cloned()
+        .collect()
+}
+
+fn ssid_matches(left: &[u8], right: &[u8]) -> bool {
+    !left.is_empty() && !right.is_empty() && left == right
+}
+
 #[derive(Debug)]
 pub(crate) enum ScanEvent {
     WatcherReady,
     WatcherWarning(String),
     AccessPointsChanged,
     LastScanChanged { device_path: String, value: i64 },
+}
+
+pub(crate) fn display_ssid(ssid_bytes: &[u8]) -> String {
+    String::from_utf8_lossy(ssid_bytes).into_owned()
 }
 
 pub(crate) fn security_label(flags: u32, wpa_flags: u32, rsn_flags: u32) -> String {
@@ -145,9 +297,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        NM_AP_FLAGS_PRIVACY, NM_AP_SEC_KEY_MGMT_OWE, NM_AP_SEC_KEY_MGMT_PSK,
-        NM_AP_SEC_KEY_MGMT_SAE, ap_is_passwordless, ap_supports_psk, ap_uses_wep, retry_delay,
-        security_label,
+        ConnectivityStatus, NM_AP_FLAGS_PRIVACY, NM_AP_SEC_KEY_MGMT_OWE, NM_AP_SEC_KEY_MGMT_PSK,
+        NM_AP_SEC_KEY_MGMT_SAE, WifiConnectTarget, ap_is_passwordless, ap_supports_psk,
+        ap_uses_wep, retry_delay, security_label,
     };
 
     #[test]
@@ -190,5 +342,40 @@ mod tests {
         assert!(ap_uses_wep(NM_AP_FLAGS_PRIVACY, 0, 0));
         assert!(!ap_uses_wep(0, 0, 0));
         assert!(!ap_uses_wep(NM_AP_FLAGS_PRIVACY, NM_AP_SEC_KEY_MGMT_PSK, 0));
+    }
+
+    #[test]
+    fn connectivity_status_maps_networkmanager_codes() {
+        let portal = ConnectivityStatus::from_nm_code(2);
+        assert_eq!(portal.state, "portal");
+        assert!(portal.captive_portal);
+        assert!(!portal.full);
+
+        let full = ConnectivityStatus::from_nm_code(4);
+        assert_eq!(full.state, "full");
+        assert!(!full.captive_portal);
+        assert!(full.full);
+    }
+
+    #[test]
+    fn connect_target_accepts_network_entry_path_alias() {
+        let target: WifiConnectTarget = serde_json::from_str(
+            r#"{
+                "ssid": "Cafe",
+                "ssid_bytes": [67, 97, 102, 101],
+                "path": "/org/freedesktop/NetworkManager/AccessPoint/1",
+                "bssid": "00:11:22:33:44:55"
+            }"#,
+        )
+        .expect("target JSON");
+
+        assert_eq!(target.ssid, "Cafe");
+        assert_eq!(target.ssid_bytes, b"Cafe");
+        assert_eq!(
+            target.ap_path.as_deref(),
+            Some("/org/freedesktop/NetworkManager/AccessPoint/1")
+        );
+        assert_eq!(target.bssid.as_deref(), Some("00:11:22:33:44:55"));
+        assert!(!target.hidden);
     }
 }

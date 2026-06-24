@@ -3,12 +3,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use zbus::blocking::{Connection, Proxy};
-use zvariant::{OwnedObjectPath, OwnedValue};
+use zvariant::{DynamicType, OwnedObjectPath, OwnedValue, Value};
 
 mod activate;
+mod connectivity;
 mod devices;
 mod scan;
 mod settings;
+mod wifi_settings;
 
 pub(crate) const NM_DEST: &str = "org.freedesktop.NetworkManager";
 pub(crate) const WIFI_IFACE: &str = "org.freedesktop.NetworkManager.Device.Wireless";
@@ -26,10 +28,16 @@ pub(super) const AP_IFACE: &str = "org.freedesktop.NetworkManager.AccessPoint";
 pub(super) const NM_DEVICE_TYPE_WIFI: u32 = 2;
 pub(super) const NM_DEVICE_STATE_DISCONNECTED: u32 = 30;
 pub(super) const NM_DEVICE_STATE_ACTIVATED: u32 = 100;
-pub(super) const NM_DEVICE_STATE_DEACTIVATING: u32 = 110;
 pub(super) const NM_ACTIVE_CONNECTION_STATE_ACTIVATED: u32 = 2;
 
 pub(super) type ConnectionSettings = HashMap<String, HashMap<String, OwnedValue>>;
+
+pub(super) fn owned_value<T>(value: T) -> Result<OwnedValue>
+where
+    T: Into<Value<'static>> + DynamicType,
+{
+    OwnedValue::try_from(Value::new(value)).context("create D-Bus variant value")
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct WifiActivationStatus {
@@ -46,8 +54,10 @@ impl WifiActivationStatus {
     }
 
     pub(crate) fn terminal_failure_after_progress(&self) -> bool {
+        // NetworkManager commonly moves a Wi-Fi device through low states while
+        // replacing an existing active connection. The caller applies a grace
+        // period before treating this as terminal.
         self.device_state <= NM_DEVICE_STATE_DISCONNECTED
-            || self.device_state >= NM_DEVICE_STATE_DEACTIVATING
     }
 }
 

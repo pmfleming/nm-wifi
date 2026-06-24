@@ -4,16 +4,18 @@ use anyhow::{Context, Result};
 use zvariant::OwnedObjectPath;
 
 use super::{AP_IFACE, DEVICE_IFACE, NM_DEVICE_TYPE_WIFI, NM_IFACE, NM_PATH, Nm, WIFI_IFACE};
-use crate::model::{AccessPoint, WifiDevice, security_label};
+use crate::model::{AccessPoint, WifiConnectTarget, WifiDevice, display_ssid, security_label};
 
 impl Nm {
     pub(crate) fn wifi_devices(&self) -> Result<Vec<WifiDevice>> {
         let nm = self.proxy(NM_PATH, NM_IFACE)?;
         let devices: Vec<OwnedObjectPath> = nm.call("GetDevices", &()).context("GetDevices")?;
-        devices
+        let wifi_devices: Vec<_> = devices
             .into_iter()
             .filter_map(|path| self.wifi_device(path).transpose())
-            .collect()
+            .collect::<Result<_>>()?;
+        tracing::debug!(count = wifi_devices.len(), "discovered Wi-Fi devices");
+        Ok(wifi_devices)
     }
 
     fn wifi_device(&self, path: OwnedObjectPath) -> Result<Option<WifiDevice>> {
@@ -28,6 +30,7 @@ impl Nm {
             .get_property("Interface")
             .unwrap_or_else(|_| path.to_string());
         drop(device);
+        tracing::debug!(path = %path, iface = %iface, "found Wi-Fi device");
         Ok(Some(WifiDevice { path, iface }))
     }
 
@@ -43,22 +46,54 @@ impl Nm {
         Ok(None)
     }
 
+    pub(crate) fn active_ssid_matches(&self, target: &WifiConnectTarget) -> Result<bool> {
+        let target_ssid = target.ssid_bytes();
+        for device in self.wifi_devices()? {
+            let Some(active_path) = self.active_access_point(&device)? else {
+                continue;
+            };
+            let ap = self.access_point(&device.path, &active_path, true)?;
+            if access_point_matches(
+                &ap,
+                target_ssid.as_ref(),
+                target.ap_path.as_deref(),
+                target.bssid.as_deref(),
+            ) {
+                tracing::debug!(ssid = %target.ssid, bssid = %ap.bssid, ap_path = %ap.path, "target access point is active");
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub(super) fn visible_access_point_for(
         &self,
-        ssid: &str,
-        ap_path: Option<&str>,
-        bssid: Option<&str>,
+        target: &WifiConnectTarget,
     ) -> Result<Option<(WifiDevice, OwnedObjectPath, AccessPoint)>> {
+        let target_ssid = target.ssid_bytes();
         for device in self.wifi_devices()? {
             for path in self.device_access_points(&device)? {
                 let Ok(ap) = self.access_point(&device.path, &path, false) else {
                     continue;
                 };
-                if access_point_matches(&ap, ssid, ap_path, bssid) {
+                if access_point_matches(
+                    &ap,
+                    target_ssid.as_ref(),
+                    target.ap_path.as_deref(),
+                    target.bssid.as_deref(),
+                ) {
+                    tracing::debug!(
+                        ssid = %target.ssid,
+                        iface = %device.iface,
+                        ap_path = %path,
+                        bssid = %ap.bssid,
+                        "matched visible access point"
+                    );
                     return Ok(Some((device, path, ap)));
                 }
             }
         }
+        tracing::debug!(ssid = %target.ssid, "no matching visible access point found");
         Ok(None)
     }
 
@@ -67,13 +102,18 @@ impl Nm {
         for device in self.wifi_devices()? {
             self.add_device_access_points(&device, &mut by_ssid)?;
         }
-        Ok(sorted_access_points(by_ssid))
+        let aps = sorted_access_points(by_ssid);
+        tracing::debug!(
+            count = aps.len(),
+            "listed visible Wi-Fi networks after SSID deduplication"
+        );
+        Ok(aps)
     }
 
     fn add_device_access_points(
         &self,
         device: &WifiDevice,
-        by_ssid: &mut BTreeMap<String, AccessPoint>,
+        by_ssid: &mut BTreeMap<Vec<u8>, AccessPoint>,
     ) -> Result<()> {
         let active_path = self.active_access_point(device)?;
         for path in self.device_access_points(device)? {
@@ -130,7 +170,8 @@ impl Nm {
         let rsn_flags = ap.get_property("RsnFlags").unwrap_or(0);
 
         Ok(AccessPoint {
-            ssid: String::from_utf8_lossy(&ssid_bytes).into_owned(),
+            ssid: display_ssid(&ssid_bytes),
+            ssid_bytes,
             active,
             security: security_label(flags, wpa_flags, rsn_flags),
             strength: ap.get_property("Strength").unwrap_or(0),
@@ -148,25 +189,26 @@ impl Nm {
 
 fn access_point_matches(
     ap: &AccessPoint,
-    ssid: &str,
+    ssid_bytes: &[u8],
     ap_path: Option<&str>,
     bssid: Option<&str>,
 ) -> bool {
-    if ap.ssid != ssid {
+    if ap.ssid_bytes().as_ref() != ssid_bytes {
         return false;
     }
-    if let Some(ap_path) = ap_path.filter(|value| !value.is_empty()) {
-        return ap.path == ap_path;
+    let ap_path = ap_path.filter(|value| !value.is_empty());
+    let bssid = bssid.filter(|value| !value.is_empty());
+    match (ap_path, bssid) {
+        (Some(ap_path), Some(bssid)) => ap.path == ap_path && ap.bssid.eq_ignore_ascii_case(bssid),
+        (Some(ap_path), None) => ap.path == ap_path,
+        (None, Some(bssid)) => ap.bssid.eq_ignore_ascii_case(bssid),
+        (None, None) => true,
     }
-    if let Some(bssid) = bssid.filter(|value| !value.is_empty()) {
-        return ap.bssid.eq_ignore_ascii_case(bssid);
-    }
-    true
 }
 
-fn merge_access_point(by_ssid: &mut BTreeMap<String, AccessPoint>, ap: AccessPoint) {
+fn merge_access_point(by_ssid: &mut BTreeMap<Vec<u8>, AccessPoint>, ap: AccessPoint) {
     by_ssid
-        .entry(ap.ssid.clone())
+        .entry(ap.ssid_bytes().into_owned())
         .and_modify(|existing| {
             if ap.active || (!existing.active && ap.strength > existing.strength) {
                 *existing = ap.clone();
@@ -175,7 +217,7 @@ fn merge_access_point(by_ssid: &mut BTreeMap<String, AccessPoint>, ap: AccessPoi
         .or_insert(ap);
 }
 
-fn sorted_access_points(by_ssid: BTreeMap<String, AccessPoint>) -> Vec<AccessPoint> {
+fn sorted_access_points(by_ssid: BTreeMap<Vec<u8>, AccessPoint>) -> Vec<AccessPoint> {
     let mut aps: Vec<_> = by_ssid.into_values().collect();
     aps.sort_by(|a, b| {
         b.active
@@ -184,4 +226,52 @@ fn sorted_access_points(by_ssid: BTreeMap<String, AccessPoint>) -> Vec<AccessPoi
             .then_with(|| a.ssid.to_lowercase().cmp(&b.ssid.to_lowercase()))
     });
     aps
+}
+
+#[cfg(test)]
+mod tests {
+    use super::access_point_matches;
+    use crate::model::AccessPoint;
+
+    #[test]
+    fn access_point_match_requires_path_and_bssid_when_both_are_supplied() {
+        let ap = test_ap();
+
+        assert!(access_point_matches(
+            &ap,
+            b"Example",
+            Some("/ap/1"),
+            Some("00:11:22:33:44:55")
+        ));
+        assert!(!access_point_matches(
+            &ap,
+            b"Example",
+            Some("/ap/other"),
+            Some("00:11:22:33:44:55")
+        ));
+        assert!(!access_point_matches(
+            &ap,
+            b"Example",
+            Some("/ap/1"),
+            Some("00:11:22:33:44:66")
+        ));
+    }
+
+    fn test_ap() -> AccessPoint {
+        AccessPoint {
+            ssid: "Example".to_string(),
+            ssid_bytes: b"Example".to_vec(),
+            active: false,
+            security: "WPA2/3".to_string(),
+            strength: 80,
+            frequency: 2412,
+            bssid: "00:11:22:33:44:55".to_string(),
+            last_seen: 0,
+            path: "/ap/1".to_string(),
+            device_path: "/device/1".to_string(),
+            flags: 0,
+            wpa_flags: 0,
+            rsn_flags: 0,
+        }
+    }
 }

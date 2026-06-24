@@ -1,84 +1,38 @@
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread;
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
-use zbus::blocking::{Connection, Proxy};
+use anyhow::Result;
 
 use crate::model::{ScanEvent, ScanStreamOptions, WifiDevice, retry_delay};
-use crate::nm::{NM_DEST, Nm, POLL_INTERVAL, WIFI_IFACE};
-use crate::output::{StreamOutput, emit_stream_event};
+use crate::nm::{Nm, POLL_INTERVAL};
+use crate::stream_emit::{
+    emit_complete, emit_empty_device_stream, emit_snapshot, emit_status, emit_warning,
+};
 
 impl Nm {
     pub(crate) fn scan_stream(&self, options: ScanStreamOptions) -> Result<()> {
+        tracing::info!(
+            timeout_secs = options.timeout.as_secs(),
+            retries = options.retries,
+            cache = options.cache,
+            "starting streaming Wi-Fi scan"
+        );
         let devices = self.wifi_devices()?;
         if devices.is_empty() {
             return emit_empty_device_stream(self, options.cache);
         }
 
-        let rx = spawn_device_watchers(self.connection(), &devices);
+        let rx = crate::stream_watch::spawn_device_watchers(self.connection(), &devices);
         emit_status("preparing scan watchers", options.cache)?;
         emit_snapshot(self, true, options.cache)?;
         drain_watcher_startup(
             &rx,
-            devices.len() * watcher_count_per_device(),
+            devices.len() * crate::stream_watch::watcher_count_per_device(),
             options.cache,
         )?;
 
         ScanSession::new(self, rx, devices, options).run()
     }
-}
-
-fn emit_status(message: impl Into<String>, cache: bool) -> Result<()> {
-    emit_message(MessageKind::Status, message, cache)
-}
-
-fn emit_warning(message: impl Into<String>, cache: bool) -> Result<()> {
-    emit_message(MessageKind::Warning, message, cache)
-}
-
-fn emit_message(kind: MessageKind, message: impl Into<String>, cache: bool) -> Result<()> {
-    let message = message.into();
-    if cache {
-        crate::cache::write_status(kind.cache_state(), &message)?;
-    }
-    emit_stream_event(&kind.stream_output(message))
-}
-
-#[derive(Clone, Copy)]
-enum MessageKind {
-    Status,
-    Warning,
-}
-
-impl MessageKind {
-    fn cache_state(self) -> &'static str {
-        match self {
-            MessageKind::Status => "status",
-            MessageKind::Warning => "warning",
-        }
-    }
-
-    fn stream_output(self, message: String) -> StreamOutput<'static> {
-        match self {
-            MessageKind::Status => StreamOutput::Status { message },
-            MessageKind::Warning => StreamOutput::Warning { message },
-        }
-    }
-}
-
-fn emit_snapshot(nm: &Nm, scanning: bool, cache: bool) -> Result<usize> {
-    let networks = nm.list_access_points()?;
-    let networks_found = networks.len();
-    if cache {
-        crate::cache::write_live_scan_snapshot(scanning, &networks)?;
-    }
-    emit_stream_event(&StreamOutput::Snapshot {
-        scanning,
-        networks_found,
-        networks: &networks,
-    })?;
-    Ok(networks_found)
 }
 
 struct DeviceScanState {
@@ -87,6 +41,8 @@ struct DeviceScanState {
     completed: bool,
     attempts: u32,
     next_retry: Option<Instant>,
+    request_succeeded: bool,
+    request_failed: bool,
 }
 
 struct ScanSession<'a> {
@@ -118,6 +74,8 @@ impl<'a> ScanSession<'a> {
                     completed: false,
                     attempts: 0,
                     next_retry: Some(Instant::now()),
+                    request_succeeded: false,
+                    request_failed: false,
                 })
                 .collect(),
             options,
@@ -179,6 +137,7 @@ impl<'a> ScanSession<'a> {
     fn note_scan_requested(&mut self, index: usize, max_attempts: u32) -> Result<()> {
         let state = &mut self.states[index];
         state.next_retry = None;
+        state.request_succeeded = true;
         emit_status(
             format!(
                 "requested scan on {} (attempt {}/{max_attempts})",
@@ -210,6 +169,7 @@ impl<'a> ScanSession<'a> {
         }
         state.next_retry = None;
         state.completed = true;
+        state.request_failed = true;
         emit_warning(
             format!(
                 "scan request on {} failed after {max_attempts} attempts: {err:#}; continuing with cached results",
@@ -281,129 +241,48 @@ impl<'a> ScanSession<'a> {
     fn finish(mut self) -> Result<()> {
         self.networks_found = emit_snapshot(self.nm, false, self.options.cache)?;
         if self.options.cache {
-            crate::cache::write_complete(self.timed_out, self.networks_found)?;
+            if let Some(message) = self.final_scan_warning() {
+                crate::cache::write_status("warning", message)?;
+            } else {
+                crate::cache::write_complete(self.timed_out, self.networks_found)?;
+            }
         }
-        emit_stream_event(&StreamOutput::Complete {
-            timed_out: self.timed_out,
-            networks_found: self.networks_found,
-        })
+        tracing::info!(
+            timed_out = self.timed_out,
+            networks_found = self.networks_found,
+            "streaming Wi-Fi scan finished"
+        );
+        emit_complete(self.timed_out, self.networks_found)
     }
-}
 
-#[derive(Clone, Copy)]
-enum WatchKind {
-    AccessPoint(&'static str),
-    LastScan,
-}
-
-struct WatcherSpec {
-    conn: Connection,
-    path: zvariant::OwnedObjectPath,
-    iface: String,
-    device_path: String,
-    kind: WatchKind,
-    tx: Sender<ScanEvent>,
-}
-
-fn emit_empty_device_stream(nm: &Nm, cache: bool) -> Result<()> {
-    emit_warning(
-        "no Wi-Fi devices found; showing cached NetworkManager results",
-        cache,
-    )?;
-    let networks_found = emit_snapshot(nm, false, cache)?;
-    if cache {
-        crate::cache::write_complete(false, networks_found)?;
-    }
-    emit_stream_event(&StreamOutput::Complete {
-        timed_out: false,
-        networks_found,
-    })
-}
-
-fn spawn_device_watchers(conn: Connection, devices: &[WifiDevice]) -> Receiver<ScanEvent> {
-    let (tx, rx) = mpsc::channel();
-    for device in devices {
-        for kind in watch_kinds() {
-            spawn_watcher(watcher_spec(&conn, device, kind, &tx));
+    fn final_scan_warning(&self) -> Option<String> {
+        if self.timed_out {
+            return None;
         }
-    }
-    rx
-}
-
-fn watch_kinds() -> [WatchKind; 3] {
-    [
-        WatchKind::AccessPoint("AccessPointAdded"),
-        WatchKind::AccessPoint("AccessPointRemoved"),
-        WatchKind::LastScan,
-    ]
-}
-
-fn watcher_count_per_device() -> usize {
-    watch_kinds().len()
-}
-
-fn watcher_spec(
-    conn: &Connection,
-    device: &WifiDevice,
-    kind: WatchKind,
-    tx: &Sender<ScanEvent>,
-) -> WatcherSpec {
-    WatcherSpec {
-        conn: conn.clone(),
-        path: device.path.clone(),
-        iface: device.iface.clone(),
-        device_path: device.path.to_string(),
-        kind,
-        tx: tx.clone(),
-    }
-}
-
-fn spawn_watcher(spec: WatcherSpec) {
-    thread::spawn(move || {
-        if let Err(err) = run_watcher(&spec) {
-            let _ = spec.tx.send(ScanEvent::WatcherWarning(format!(
-                "{} watcher for {} failed: {err:#}",
-                spec.kind.label(),
-                spec.iface
-            )));
+        let failed = self
+            .states
+            .iter()
+            .filter(|state| state.request_failed)
+            .count();
+        if failed == 0 {
+            return None;
         }
-    });
-}
-
-fn run_watcher(spec: &WatcherSpec) -> Result<()> {
-    let proxy = Proxy::new(&spec.conn, NM_DEST, spec.path.as_str(), WIFI_IFACE)
-        .context("create Wi-Fi watcher proxy")?;
-    let _ = spec.tx.send(ScanEvent::WatcherReady);
-    match spec.kind {
-        WatchKind::AccessPoint(signal_name) => watch_access_points(&proxy, signal_name, &spec.tx),
-        WatchKind::LastScan => watch_last_scan(&proxy, spec),
+        let succeeded = self
+            .states
+            .iter()
+            .filter(|state| state.request_succeeded)
+            .count();
+        if succeeded == 0 {
+            return Some(format!(
+                "scan request failed on all devices; showing cached results ({} networks available)",
+                self.networks_found
+            ));
+        }
+        Some(format!(
+            "scan finished with {failed} device scan request failure(s); {} networks available",
+            self.networks_found
+        ))
     }
-}
-
-fn watch_access_points(
-    proxy: &Proxy<'_>,
-    signal_name: &'static str,
-    tx: &Sender<ScanEvent>,
-) -> Result<()> {
-    let mut signals = proxy
-        .receive_signal(signal_name)
-        .with_context(|| format!("receive {signal_name}"))?;
-    for _signal in &mut signals {
-        let _ = tx.send(ScanEvent::AccessPointsChanged);
-    }
-    Ok(())
-}
-
-fn watch_last_scan(proxy: &Proxy<'_>, spec: &WatcherSpec) -> Result<()> {
-    let mut changes = proxy.receive_property_changed::<i64>("LastScan");
-    for change in &mut changes {
-        let value = change.get().context("read changed LastScan")?;
-        let _ = spec.tx.send(ScanEvent::LastScanChanged {
-            device_path: spec.device_path.clone(),
-            value,
-        });
-    }
-    Ok(())
 }
 
 fn drain_watcher_startup(
@@ -455,13 +334,4 @@ fn retry_is_due(state: &DeviceScanState, now: Instant, max_attempts: u32) -> boo
 
 fn last_scan_matches(state: &DeviceScanState, device_path: &str, value: i64) -> bool {
     state.device.path.as_str() == device_path && value != state.before && value >= 0
-}
-
-impl WatchKind {
-    fn label(self) -> &'static str {
-        match self {
-            WatchKind::AccessPoint(signal_name) => signal_name,
-            WatchKind::LastScan => "LastScan",
-        }
-    }
 }

@@ -1,0 +1,7 @@
+project_name = "nm-wifi"
+project_root = "."
+source_roots = ["src"]
+output_dir = "target/analysis"
+
+[rust]
+helper_manifest = "../rust-quality-lens/rust_helpers/Cargo.toml"

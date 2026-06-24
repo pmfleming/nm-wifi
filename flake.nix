@@ -1,32 +1,38 @@
 {
-  description = "Rust NetworkManager D-Bus Wi-Fi helper for rofi";
+  description = "NetworkManager D-Bus Wi-Fi helper";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
   outputs = { self, nixpkgs }:
     let
       systems = [ "x86_64-linux" ];
-      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system nixpkgs.legacyPackages.${system});
     in
     {
-      packages = forAllSystems (pkgs: {
+      packages = forAllSystems (system: pkgs: {
         default = pkgs.rustPlatform.buildRustPackage {
-          pname = "nm-wifi-rofi";
+          pname = "nm-wifi";
           version = "0.1.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           nativeBuildInputs = with pkgs; [ pkg-config ];
+          meta = {
+            description = "NetworkManager D-Bus Wi-Fi helper";
+            mainProgram = "nm-wifi";
+            platforms = pkgs.lib.platforms.linux;
+          };
         };
       });
 
-      apps = forAllSystems (pkgs: {
+      apps = forAllSystems (system: pkgs: {
         default = {
           type = "app";
-          program = "${self.packages.${pkgs.system}.default}/bin/nm-wifi-rofi";
+          program = "${self.packages.${system}.default}/bin/nm-wifi";
+          meta.description = "Run the nm-wifi NetworkManager helper";
         };
       });
 
-      devShells = forAllSystems (pkgs: {
+      devShells = forAllSystems (system: pkgs: {
         default = pkgs.mkShell {
           packages = with pkgs; [
             cargo
@@ -43,6 +49,6 @@
         };
       });
 
-      formatter = forAllSystems (pkgs: pkgs.nixpkgs-fmt);
+      formatter = forAllSystems (system: pkgs: pkgs.nixpkgs-fmt);
     };
 }

@@ -1,11 +1,19 @@
-use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+use clap::{ArgAction, Parser, Subcommand};
 
 use crate::model::WepKeyType;
 
 #[derive(Parser)]
-#[command(name = "nm-wifi-rofi")]
-#[command(about = "NetworkManager D-Bus Wi-Fi helper for rofi")]
+#[command(name = "nm-wifi")]
+#[command(about = "NetworkManager D-Bus Wi-Fi helper")]
 pub(crate) struct Cli {
+    /// Increase stderr logging verbosity (-v info, -vv debug). Detailed logs always go to the log file.
+    #[arg(short, long, global = true, action = ArgAction::Count)]
+    pub(crate) verbose: u8,
+    /// Write detailed logs to this file instead of $XDG_RUNTIME_DIR/nm-wifi/nm-wifi.log.
+    #[arg(long, global = true)]
+    pub(crate) log_file: Option<PathBuf>,
     #[command(subcommand)]
     pub(crate) command: Command,
 }
@@ -20,6 +28,27 @@ pub(crate) enum Command {
         /// Use the latest cached live-scan snapshot if available.
         #[arg(long)]
         cached: bool,
+        /// Refresh the scan cache after returning cached results. If no cache exists, scan first.
+        #[arg(long)]
+        refresh_cache: bool,
+        /// Scan timeout in seconds when --refresh-cache has to scan before returning.
+        #[arg(long, default_value_t = 10)]
+        refresh_timeout: u64,
+    },
+    /// List visible Wi-Fi networks enriched with saved-profile matches and capabilities.
+    Networks {
+        /// Emit JSON instead of TSV.
+        #[arg(long)]
+        json: bool,
+        /// Use the latest cached live-scan snapshot if available.
+        #[arg(long)]
+        cached: bool,
+        /// Refresh the scan cache after returning cached results. If no cache exists, scan first.
+        #[arg(long)]
+        refresh_cache: bool,
+        /// Scan timeout in seconds when --refresh-cache has to scan before returning.
+        #[arg(long, default_value_t = 10)]
+        refresh_timeout: u64,
     },
     /// Request a scan, wait for completion, then list visible Wi-Fi networks as TSV.
     Scan {
@@ -35,7 +64,7 @@ pub(crate) enum Command {
         /// Number of scan request retries when NetworkManager rejects a request.
         #[arg(long, default_value_t = 2)]
         retries: u32,
-        /// Write latest snapshot/status files under $XDG_RUNTIME_DIR/nm-wifi-rofi.
+        /// Write latest snapshot/status files under $XDG_RUNTIME_DIR/nm-wifi.
         #[arg(long)]
         cache: bool,
     },
@@ -55,19 +84,57 @@ pub(crate) enum Command {
         /// Interpret password as a WEP key or WEP passphrase.
         #[arg(long, value_enum)]
         wep_key_type: Option<WepKeyType>,
+        /// Emit structured JSON result.
+        #[arg(long)]
+        json: bool,
     },
-    /// Emit a rofi script-mode menu backed by cached live-scan snapshots.
-    Rofi {
-        /// Background scan timeout in seconds when selecting rescan.
-        #[arg(long, default_value_t = 12)]
-        timeout: u64,
-        /// Background scan request retries when selecting rescan.
-        #[arg(long, default_value_t = 2)]
-        retries: u32,
-        /// Rofi passes the selected row text as a positional argument on callbacks.
-        #[arg(hide = true, trailing_var_arg = true, allow_hyphen_values = true)]
-        rofi_args: Vec<String>,
+    /// Connect to an exact JSON target from `nm-wifi networks --json`.
+    ConnectTarget {
+        /// JSON object with ssid, ssid_bytes, ap_path/path, bssid, and hidden fields.
+        target_json: String,
+        /// Password for creating a new WPA/WPA2/WPA3-Personal connection over D-Bus.
+        #[arg(long)]
+        password: Option<String>,
+        /// Interpret password as a WEP key or WEP passphrase.
+        #[arg(long, value_enum)]
+        wep_key_type: Option<WepKeyType>,
+        /// Emit structured JSON result.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List saved Wi-Fi NetworkManager profiles.
+    Saved {
+        /// Emit JSON instead of TSV.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage a saved Wi-Fi NetworkManager profile by D-Bus object path.
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
+    },
+    /// Check NetworkManager connectivity state.
+    Connectivity {
+        /// Emit JSON instead of plain state text.
+        #[arg(long)]
+        json: bool,
     },
     /// Print the active SSID, if any.
     Active,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ProfileCommand {
+    /// Delete/forget a saved Wi-Fi profile.
+    Delete {
+        /// NetworkManager settings object path, from `nm-wifi saved --json`.
+        path: String,
+    },
+    /// Enable or disable autoconnect for a saved Wi-Fi profile.
+    Autoconnect {
+        /// NetworkManager settings object path, from `nm-wifi saved --json`.
+        path: String,
+        /// true to enable autoconnect, false to disable it.
+        enabled: bool,
+    },
 }

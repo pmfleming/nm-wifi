@@ -1,0 +1,98 @@
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use anyhow::{Context, Result};
+use tracing_subscriber::filter::EnvFilter;
+use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::prelude::*;
+
+#[derive(Clone)]
+struct SharedFileWriter {
+    file: Arc<Mutex<std::fs::File>>,
+}
+
+struct LockedFileWriter {
+    file: Arc<Mutex<std::fs::File>>,
+}
+
+impl<'a> MakeWriter<'a> for SharedFileWriter {
+    type Writer = LockedFileWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LockedFileWriter {
+            file: Arc::clone(&self.file),
+        }
+    }
+}
+
+impl Write for LockedFileWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.file
+            .lock()
+            .map_err(|_| io::Error::other("log file lock poisoned"))?
+            .write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file
+            .lock()
+            .map_err(|_| io::Error::other("log file lock poisoned"))?
+            .flush()
+    }
+}
+
+pub(crate) fn init(verbose: u8, log_file: Option<PathBuf>) -> Result<PathBuf> {
+    let log_path = log_file
+        .or_else(|| std::env::var_os("NM_WIFI_LOG_FILE").map(PathBuf::from))
+        .unwrap_or_else(crate::cache::log_path);
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("open log file {}", log_path.display()))?;
+
+    let stderr_filter = EnvFilter::try_from_env("NM_WIFI_STDERR_LOG")
+        .unwrap_or_else(|_| EnvFilter::new(stderr_directive(verbose)));
+    let file_filter = EnvFilter::try_from_env("NM_WIFI_LOG")
+        .unwrap_or_else(|_| EnvFilter::new(file_directive(verbose)));
+
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(io::stderr)
+        .with_ansi(false)
+        .with_filter(stderr_filter);
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(SharedFileWriter {
+            file: Arc::new(Mutex::new(file)),
+        })
+        .with_ansi(false)
+        .with_filter(file_filter);
+
+    tracing_subscriber::registry()
+        .with(stderr_layer)
+        .with(file_layer)
+        .try_init()
+        .context("initialize tracing subscriber")?;
+
+    tracing::info!(path = %log_path.display(), "logging initialized");
+    Ok(log_path)
+}
+
+fn stderr_directive(verbose: u8) -> &'static str {
+    match verbose {
+        0 => "warn",
+        1 => "info",
+        _ => "debug",
+    }
+}
+
+fn file_directive(verbose: u8) -> &'static str {
+    match verbose {
+        0 | 1 => "nm_wifi=debug,warn",
+        _ => "debug",
+    }
+}

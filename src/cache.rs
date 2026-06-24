@@ -9,8 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::model::AccessPoint;
 
 const CACHE_VERSION: u32 = 1;
-const CACHE_DIR_NAME: &str = "nm-wifi-rofi";
-const REVEAL_INTERVAL_MS: u128 = 10;
+const CACHE_DIR_NAME: &str = "nm-wifi";
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -24,37 +23,13 @@ pub(crate) struct CachedSnapshot {
 }
 
 impl CachedSnapshot {
-    pub(crate) fn scanning(&self) -> bool {
-        self.scanning
-    }
-
-    pub(crate) fn updated_at_ms(&self) -> u128 {
-        self.updated_at_ms
-    }
-
-    pub(crate) fn networks_found(&self) -> usize {
-        self.networks_found
-    }
-
-    pub(crate) fn networks(&self) -> &[AccessPoint] {
-        &self.networks
-    }
-
     pub(crate) fn into_networks(self) -> Vec<AccessPoint> {
         self.networks
     }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-struct RevealState {
-    active: bool,
-    visible_count: usize,
-    last_reveal_ms: u128,
-    source_updated_at_ms: u128,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub(crate) struct CachedStatus {
+struct CachedStatus {
     version: u32,
     updated_at_ms: u128,
     state: String,
@@ -63,75 +38,15 @@ pub(crate) struct CachedStatus {
     networks_found: Option<usize>,
 }
 
-impl CachedStatus {
-    pub(crate) fn message(&self) -> &str {
-        &self.message
-    }
-}
-
-pub(crate) fn reset_progressive_reveal() -> Result<()> {
-    write_json(
-        reveal_path(),
-        &RevealState {
-            active: true,
-            visible_count: 0,
-            last_reveal_ms: 0,
-            source_updated_at_ms: 0,
-        },
-    )
-}
-
-pub(crate) fn visible_network_count(
-    scanning: bool,
-    snapshot_updated_at_ms: u128,
-    available: usize,
-) -> Result<usize> {
-    let Some(mut reveal) = read_reveal()? else {
-        return Ok(available);
-    };
-    if !reveal.active {
-        return Ok(available);
-    }
-
-    reveal.visible_count = reveal.visible_count.min(available);
-    if should_reveal_next(&reveal, available) {
-        reveal.visible_count += 1;
-        reveal.last_reveal_ms = now_ms();
-        reveal.source_updated_at_ms = snapshot_updated_at_ms;
-    }
-    reveal.active = scanning || reveal.visible_count < available;
-    let visible_count = reveal.visible_count;
-    write_json(reveal_path(), &reveal)?;
-    Ok(visible_count)
-}
-
-fn should_reveal_next(reveal: &RevealState, available: usize) -> bool {
-    available > reveal.visible_count
-        && (reveal.visible_count == 0
-            || now_ms().saturating_sub(reveal.last_reveal_ms) >= REVEAL_INTERVAL_MS)
-}
-
-pub(crate) fn write_empty_scanning_snapshot() -> Result<()> {
-    write_session_snapshot(true, &[])
-}
-
 pub(crate) fn write_live_scan_snapshot(scanning: bool, networks: &[AccessPoint]) -> Result<()> {
-    if scanning {
-        return write_session_snapshot(true, networks);
+    if !scanning {
+        write_snapshot(false, networks)?;
     }
-    write_snapshot(false, networks)?;
-    write_session_snapshot(false, networks)
+    write_session_snapshot(scanning, networks)
 }
 
 pub(crate) fn write_snapshot(scanning: bool, networks: &[AccessPoint]) -> Result<()> {
-    let snapshot = CachedSnapshot {
-        version: CACHE_VERSION,
-        updated_at_ms: now_ms(),
-        scanning,
-        networks_found: networks.len(),
-        networks: networks.to_vec(),
-    };
-    write_json(snapshot_path(), &snapshot)
+    write_snapshot_to(snapshot_path(), scanning, networks)
 }
 
 pub(crate) fn write_status(state: impl Into<String>, message: impl Into<String>) -> Result<()> {
@@ -165,27 +80,22 @@ pub(crate) fn read_snapshot() -> Result<Option<CachedSnapshot>> {
     read_json(snapshot_path())
 }
 
-pub(crate) fn read_session_snapshot() -> Result<Option<CachedSnapshot>> {
-    read_json(session_path())
-}
-
-pub(crate) fn read_status() -> Result<Option<CachedStatus>> {
-    read_json(status_path())
-}
-
-fn read_reveal() -> Result<Option<RevealState>> {
-    read_json(reveal_path())
-}
-
 fn write_session_snapshot(scanning: bool, networks: &[AccessPoint]) -> Result<()> {
-    let snapshot = CachedSnapshot {
+    write_snapshot_to(session_path(), scanning, networks)
+}
+
+fn write_snapshot_to(path: PathBuf, scanning: bool, networks: &[AccessPoint]) -> Result<()> {
+    write_json(path, &snapshot_record(scanning, networks))
+}
+
+fn snapshot_record(scanning: bool, networks: &[AccessPoint]) -> CachedSnapshot {
+    CachedSnapshot {
         version: CACHE_VERSION,
         updated_at_ms: now_ms(),
         scanning,
         networks_found: networks.len(),
         networks: networks.to_vec(),
-    };
-    write_json(session_path(), &snapshot)
+    }
 }
 
 fn write_status_record(status: CachedStatus) -> Result<()> {
@@ -245,8 +155,8 @@ fn session_path() -> PathBuf {
     cache_dir().join("scan-session.json")
 }
 
-fn reveal_path() -> PathBuf {
-    cache_dir().join("reveal.json")
+pub(crate) fn log_path() -> PathBuf {
+    cache_dir().join("nm-wifi.log")
 }
 
 fn cache_dir() -> PathBuf {
@@ -271,7 +181,7 @@ mod tests {
 
     #[test]
     fn temp_paths_are_unique_for_same_cache_path() {
-        let path = PathBuf::from("/tmp/nm-wifi-rofi/status.json");
+        let path = PathBuf::from("/tmp/nm-wifi/status.json");
 
         let first = temp_path_for(&path).expect("first temp path");
         let second = temp_path_for(&path).expect("second temp path");
