@@ -1,6 +1,6 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -44,17 +44,35 @@ impl Write for LockedFileWriter {
 }
 
 pub(crate) fn init(verbose: u8, log_file: Option<PathBuf>) -> Result<PathBuf> {
+    let env_log_file = std::env::var_os("NM_WIFI_LOG_FILE").map(PathBuf::from);
+    let use_default_log_path = log_file.is_none() && env_log_file.is_none();
     let log_path = log_file
-        .or_else(|| std::env::var_os("NM_WIFI_LOG_FILE").map(PathBuf::from))
+        .or(env_log_file)
         .unwrap_or_else(crate::cache::log_path);
     if let Some(parent) = log_path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        if use_default_log_path {
+            crate::cache::create_private_dir_all(parent)?;
+        } else {
+            create_log_parent(parent)?;
+        }
     }
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
+    reject_symlink(&log_path)?;
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
         .open(&log_path)
         .with_context(|| format!("open log file {}", log_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&log_path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 0600 {}", log_path.display()))?;
+    }
 
     let stderr_filter = EnvFilter::try_from_env("NM_WIFI_STDERR_LOG")
         .unwrap_or_else(|_| EnvFilter::new(stderr_directive(verbose)));
@@ -80,6 +98,25 @@ pub(crate) fn init(verbose: u8, log_file: Option<PathBuf>) -> Result<PathBuf> {
 
     tracing::info!(path = %log_path.display(), "logging initialized");
     Ok(log_path)
+}
+
+fn reject_symlink(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("lstat {}", path.display())),
+    };
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!("refusing to use symlinked log file {}", path.display());
+    }
+    Ok(())
+}
+
+fn create_log_parent(parent: &Path) -> Result<()> {
+    if parent.exists() {
+        return Ok(());
+    }
+    crate::cache::create_private_dir_all(parent)
 }
 
 fn stderr_directive(verbose: u8) -> &'static str {

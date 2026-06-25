@@ -1,10 +1,19 @@
 use std::borrow::Cow;
 use std::time::Duration;
 
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use zvariant::OwnedObjectPath;
 
 pub(crate) const NM_AP_FLAGS_PRIVACY: u32 = 0x1;
+pub(crate) const NM_AP_SEC_PAIR_WEP40: u32 = 0x0000_0001;
+pub(crate) const NM_AP_SEC_PAIR_WEP104: u32 = 0x0000_0002;
+pub(crate) const NM_AP_SEC_PAIR_TKIP: u32 = 0x0000_0004;
+pub(crate) const NM_AP_SEC_PAIR_CCMP: u32 = 0x0000_0008;
+pub(crate) const NM_AP_SEC_GROUP_WEP40: u32 = 0x0000_0010;
+pub(crate) const NM_AP_SEC_GROUP_WEP104: u32 = 0x0000_0020;
+pub(crate) const NM_AP_SEC_GROUP_TKIP: u32 = 0x0000_0040;
+pub(crate) const NM_AP_SEC_GROUP_CCMP: u32 = 0x0000_0080;
 pub(crate) const NM_AP_SEC_KEY_MGMT_PSK: u32 = 0x0000_0100;
 pub(crate) const NM_AP_SEC_KEY_MGMT_802_1X: u32 = 0x0000_0200;
 pub(crate) const NM_AP_SEC_KEY_MGMT_SAE: u32 = 0x0000_0400;
@@ -12,16 +21,39 @@ pub(crate) const NM_AP_SEC_KEY_MGMT_OWE: u32 = 0x0000_0800;
 pub(crate) const NM_AP_SEC_KEY_MGMT_OWE_TM: u32 = 0x0000_1000;
 pub(crate) const NM_AP_SEC_KEY_MGMT_EAP_SUITE_B_192: u32 = 0x0000_2000;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct ScanStreamOptions {
     pub(crate) timeout: Duration,
     pub(crate) retries: u32,
     pub(crate) cache: bool,
+    pub(crate) ifname: Option<String>,
+    pub(crate) ssid_bytes: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScanRequestOptions {
+    pub(crate) timeout: Duration,
+    pub(crate) ifname: Option<String>,
+    pub(crate) ssid_bytes: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ConnectFailureReason {
+    SecretRequired,
+    AuthorizationRequired,
+    UnsupportedAuth,
+    ValidationError,
+    Timeout,
+    ActivationFailed,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ConnectResult {
     pub(crate) status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<ConnectFailureReason>,
     pub(crate) ssid: String,
     pub(crate) message: String,
     pub(crate) connectivity: Option<ConnectivityStatus>,
@@ -137,6 +169,16 @@ pub(crate) struct WifiConnectTarget {
     #[serde(alias = "path")]
     pub(crate) ap_path: Option<String>,
     pub(crate) bssid: Option<String>,
+    #[serde(default, alias = "device_iface")]
+    pub(crate) ifname: Option<String>,
+    #[serde(default)]
+    pub(crate) device_path: Option<String>,
+    /// Optional NetworkManager connection id requested by the frontend.
+    #[serde(default, alias = "name")]
+    pub(crate) connection_name: Option<String>,
+    /// Restrict a newly-created connection to the current user when supported.
+    #[serde(default)]
+    pub(crate) private: bool,
     #[serde(default)]
     pub(crate) hidden: bool,
     #[serde(default)]
@@ -145,11 +187,7 @@ pub(crate) struct WifiConnectTarget {
 
 impl WifiConnectTarget {
     pub(crate) fn ssid_bytes(&self) -> Cow<'_, [u8]> {
-        if self.ssid_bytes.is_empty() {
-            Cow::Borrowed(self.ssid.as_bytes())
-        } else {
-            Cow::Borrowed(&self.ssid_bytes)
-        }
+        ssid_bytes_or_display(&self.ssid_bytes, &self.ssid)
     }
 
     pub(crate) fn has_specific_ap(&self) -> bool {
@@ -158,20 +196,50 @@ impl WifiConnectTarget {
             .is_some_and(|value| !value.is_empty())
             || self.bssid.as_deref().is_some_and(|value| !value.is_empty())
     }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        validate_ssid_bytes(self.ssid_bytes().as_ref())?;
+        if let Some(bssid) = self.bssid.as_deref().filter(|value| !value.is_empty()) {
+            validate_bssid(bssid)?;
+        }
+        if self.hidden
+            && self.bssid.as_deref().is_none_or(str::is_empty)
+            && looks_like_bssid(&self.ssid)
+        {
+            bail!(
+                "hidden Wi-Fi target must be an SSID, but '{}' looks like a BSSID",
+                self.ssid
+            );
+        }
+        Ok(())
+    }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub(crate) struct NetworkCapabilities {
+    /// Backend has a supported activation flow for this network. Unsaved PSK/WEP
+    /// networks may still require the caller to provide a password.
     pub(crate) can_connect: bool,
+    /// Backend can connect without prompting for any additional secret.
+    pub(crate) can_connect_now: bool,
+    /// Backend can connect if the caller supplies a password/key.
+    pub(crate) can_connect_with_password: bool,
     pub(crate) needs_password: bool,
     pub(crate) can_forget: bool,
     pub(crate) can_toggle_autoconnect: bool,
+    pub(crate) supported_auth: bool,
+    pub(crate) unsupported_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct NetworkEntry {
     #[serde(flatten)]
     pub(crate) access_point: AccessPoint,
+    /// Exact APs for this displayed network group. The flattened access_point is
+    /// the preferred/default AP; frontends can use this list for exact BSSID,
+    /// band, and device selection.
+    #[serde(default)]
+    pub(crate) access_points: Vec<AccessPoint>,
     pub(crate) primary_profile: Option<SavedWifiConnection>,
     pub(crate) profiles: Vec<SavedWifiConnection>,
     pub(crate) capabilities: NetworkCapabilities,
@@ -188,12 +256,30 @@ pub(crate) struct AccessPoint {
     pub(crate) security: String,
     pub(crate) strength: u8,
     pub(crate) frequency: u32,
+    #[serde(default)]
+    pub(crate) channel: u32,
+    #[serde(default)]
+    pub(crate) band: String,
+    #[serde(default)]
+    pub(crate) mode: String,
+    #[serde(default)]
+    pub(crate) max_bitrate_mbps: u32,
+    #[serde(default)]
+    pub(crate) bandwidth_mhz: u32,
+    #[serde(default)]
+    pub(crate) ssid_hex: String,
+    #[serde(default)]
+    pub(crate) wpa_flags_label: String,
+    #[serde(default)]
+    pub(crate) rsn_flags_label: String,
     pub(crate) bssid: String,
     pub(crate) last_seen: i32,
     #[serde(default)]
     pub(crate) path: String,
     #[serde(default)]
     pub(crate) device_path: String,
+    #[serde(default)]
+    pub(crate) device_iface: String,
     #[serde(default)]
     pub(crate) flags: u32,
     #[serde(default)]
@@ -204,49 +290,133 @@ pub(crate) struct AccessPoint {
 
 impl AccessPoint {
     pub(crate) fn ssid_bytes(&self) -> Cow<'_, [u8]> {
-        if self.ssid_bytes.is_empty() {
-            Cow::Borrowed(self.ssid.as_bytes())
-        } else {
-            Cow::Borrowed(&self.ssid_bytes)
-        }
+        ssid_bytes_or_display(&self.ssid_bytes, &self.ssid)
     }
+}
+
+fn ssid_bytes_or_display<'a>(ssid_bytes: &'a [u8], display_ssid: &'a str) -> Cow<'a, [u8]> {
+    if ssid_bytes.is_empty() {
+        Cow::Borrowed(display_ssid.as_bytes())
+    } else {
+        Cow::Borrowed(ssid_bytes)
+    }
+}
+
+pub(crate) fn validate_ssid_bytes(ssid_bytes: &[u8]) -> Result<()> {
+    if ssid_bytes.is_empty() || ssid_bytes.len() > 32 {
+        bail!(
+            "Wi-Fi SSID must be 1-32 bytes; got {} bytes",
+            ssid_bytes.len()
+        );
+    }
+    Ok(())
+}
+
+fn validate_bssid(bssid: &str) -> Result<()> {
+    if looks_like_bssid(bssid) {
+        Ok(())
+    } else {
+        bail!("invalid BSSID '{bssid}'; expected six hexadecimal octets")
+    }
+}
+
+fn looks_like_bssid(value: &str) -> bool {
+    let separators = value.matches(':').count() + value.matches('-').count();
+    separators == 5
+        && value
+            .split([':', '-'])
+            .all(|part| part.len() == 2 && part.chars().all(|ch| ch.is_ascii_hexdigit()))
 }
 
 pub(crate) fn network_entries(
     access_points: Vec<AccessPoint>,
     profiles: &[SavedWifiConnection],
 ) -> Vec<NetworkEntry> {
-    access_points
+    grouped_access_points(access_points)
         .into_iter()
-        .map(|access_point| network_entry(access_point, profiles))
+        .map(|group| network_entry(group, profiles))
         .collect()
 }
 
-fn network_entry(access_point: AccessPoint, profiles: &[SavedWifiConnection]) -> NetworkEntry {
+pub(crate) fn network_entries_with_profile_matches(
+    access_points: Vec<AccessPoint>,
+    profile_matches_by_ap_path: &std::collections::BTreeMap<String, Vec<SavedWifiConnection>>,
+) -> Vec<NetworkEntry> {
+    grouped_access_points(access_points)
+        .into_iter()
+        .map(|group| {
+            let profiles = profiles_for_access_point_group(&group, profile_matches_by_ap_path);
+            network_entry_with_profiles(group, profiles)
+        })
+        .collect()
+}
+
+fn grouped_access_points(access_points: Vec<AccessPoint>) -> Vec<Vec<AccessPoint>> {
+    let mut groups = std::collections::BTreeMap::<Vec<u8>, Vec<AccessPoint>>::new();
+    for access_point in access_points {
+        groups
+            .entry(access_point.ssid_bytes().into_owned())
+            .or_default()
+            .push(access_point);
+    }
+    groups.into_values().collect()
+}
+
+fn network_entry(
+    access_points: Vec<AccessPoint>,
+    profiles: &[SavedWifiConnection],
+) -> NetworkEntry {
+    let access_point = access_points
+        .first()
+        .cloned()
+        .expect("network entries require at least one access point");
     let profiles = profiles_for_access_point(&access_point, profiles);
+    network_entry_with_profiles(access_points, profiles)
+}
+
+fn network_entry_with_profiles(
+    access_points: Vec<AccessPoint>,
+    profiles: Vec<SavedWifiConnection>,
+) -> NetworkEntry {
+    let access_point = access_points
+        .first()
+        .cloned()
+        .expect("network entries require at least one access point");
     let primary_profile = profiles.first().cloned();
-    let needs_password = primary_profile.is_none()
-        && !ap_is_passwordless(
+    let has_identity = !access_point.ssid_bytes().is_empty();
+    let has_profile = primary_profile.is_some();
+    let passwordless = ap_is_passwordless(
+        access_point.flags,
+        access_point.wpa_flags,
+        access_point.rsn_flags,
+    );
+    let supports_password_auth = ap_supports_psk(access_point.wpa_flags, access_point.rsn_flags)
+        || ap_uses_wep(
             access_point.flags,
             access_point.wpa_flags,
             access_point.rsn_flags,
-        )
-        && (ap_supports_psk(access_point.wpa_flags, access_point.rsn_flags)
-            || ap_uses_wep(
-                access_point.flags,
-                access_point.wpa_flags,
-                access_point.rsn_flags,
-            ));
-    let has_identity = !access_point.ssid_bytes().is_empty();
-    let has_profile = primary_profile.is_some();
+        );
+    let supported_auth = has_profile || passwordless || supports_password_auth;
+    let needs_password = has_identity && !has_profile && supports_password_auth;
+    let can_connect_now = has_identity && (has_profile || passwordless);
+    let can_connect_with_password = has_identity && !has_profile && supports_password_auth;
+    let unsupported_reason = (!supported_auth).then(|| {
+        "unsupported authentication; only saved profiles, open/OWE, WEP, and WPA/SAE-Personal are supported"
+            .to_string()
+    });
     NetworkEntry {
         access_point,
+        access_points,
         primary_profile,
         capabilities: NetworkCapabilities {
-            can_connect: has_identity && (!needs_password || has_profile),
+            can_connect: has_identity && supported_auth,
+            can_connect_now,
+            can_connect_with_password,
             needs_password,
             can_forget: has_profile,
             can_toggle_autoconnect: has_profile,
+            supported_auth,
+            unsupported_reason,
         },
         profiles,
     }
@@ -264,6 +434,25 @@ fn profiles_for_access_point(
         .collect()
 }
 
+fn profiles_for_access_point_group(
+    access_points: &[AccessPoint],
+    profile_matches_by_ap_path: &std::collections::BTreeMap<String, Vec<SavedWifiConnection>>,
+) -> Vec<SavedWifiConnection> {
+    let mut seen_paths = std::collections::BTreeSet::new();
+    let mut profiles = Vec::new();
+    for access_point in access_points {
+        let Some(matches) = profile_matches_by_ap_path.get(&access_point.path) else {
+            continue;
+        };
+        for profile in matches {
+            if seen_paths.insert(profile.path.clone()) {
+                profiles.push(profile.clone());
+            }
+        }
+    }
+    profiles
+}
+
 fn ssid_matches(left: &[u8], right: &[u8]) -> bool {
     !left.is_empty() && !right.is_empty() && left == right
 }
@@ -278,6 +467,71 @@ pub(crate) enum ScanEvent {
 
 pub(crate) fn display_ssid(ssid_bytes: &[u8]) -> String {
     String::from_utf8_lossy(ssid_bytes).into_owned()
+}
+
+pub(crate) fn ssid_hex(ssid_bytes: &[u8]) -> String {
+    ssid_bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+pub(crate) fn frequency_channel(frequency: u32) -> u32 {
+    match frequency {
+        2412..=2472 => (frequency - 2407) / 5,
+        2484 => 14,
+        5000..=5900 => (frequency - 5000) / 5,
+        5955..=7115 => ((frequency - 5955) / 5) + 1,
+        _ => 0,
+    }
+}
+
+pub(crate) fn frequency_band(frequency: u32) -> &'static str {
+    match frequency {
+        2400..=2500 => "2.4 GHz",
+        4900..=5900 => "5 GHz",
+        5925..=7125 => "6 GHz",
+        _ => "",
+    }
+}
+
+pub(crate) fn wifi_mode_label(mode: u32) -> &'static str {
+    match mode {
+        1 => "Ad-Hoc",
+        2 => "Infra",
+        4 => "Mesh",
+        _ => "N/A",
+    }
+}
+
+pub(crate) fn security_flags_label(flags: u32) -> String {
+    let labels = [
+        (NM_AP_SEC_PAIR_WEP40, "pair_wep40"),
+        (NM_AP_SEC_PAIR_WEP104, "pair_wep104"),
+        (NM_AP_SEC_PAIR_TKIP, "pair_tkip"),
+        (NM_AP_SEC_PAIR_CCMP, "pair_ccmp"),
+        (NM_AP_SEC_GROUP_WEP40, "group_wep40"),
+        (NM_AP_SEC_GROUP_WEP104, "group_wep104"),
+        (NM_AP_SEC_GROUP_TKIP, "group_tkip"),
+        (NM_AP_SEC_GROUP_CCMP, "group_ccmp"),
+        (NM_AP_SEC_KEY_MGMT_PSK, "psk"),
+        (NM_AP_SEC_KEY_MGMT_802_1X, "802.1X"),
+        (NM_AP_SEC_KEY_MGMT_SAE, "sae"),
+        (NM_AP_SEC_KEY_MGMT_OWE, "owe"),
+        (NM_AP_SEC_KEY_MGMT_OWE_TM, "owe-tm"),
+        (NM_AP_SEC_KEY_MGMT_EAP_SUITE_B_192, "wpa-eap-suite-b-192"),
+    ];
+    let value = labels
+        .into_iter()
+        .filter_map(|(bit, label)| (flags & bit != 0).then_some(label))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if value.is_empty() {
+        "(none)".to_string()
+    } else {
+        value
+    }
 }
 
 pub(crate) fn security_label(flags: u32, wpa_flags: u32, rsn_flags: u32) -> String {
@@ -331,9 +585,11 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ConnectivityStatus, NM_AP_FLAGS_PRIVACY, NM_AP_SEC_KEY_MGMT_OWE, NM_AP_SEC_KEY_MGMT_PSK,
-        NM_AP_SEC_KEY_MGMT_SAE, WifiConnectTarget, ap_is_passwordless, ap_supports_psk,
-        ap_uses_wep, retry_delay, security_label,
+        AccessPoint, ConnectivityStatus, NM_AP_FLAGS_PRIVACY, NM_AP_SEC_KEY_MGMT_802_1X,
+        NM_AP_SEC_KEY_MGMT_OWE, NM_AP_SEC_KEY_MGMT_PSK, NM_AP_SEC_KEY_MGMT_SAE,
+        SavedWifiConnection, WifiConnectTarget, ap_is_passwordless, ap_supports_psk, ap_uses_wep,
+        network_entries, network_entries_with_profile_matches, retry_delay, security_flags_label,
+        security_label,
     };
 
     #[test]
@@ -379,6 +635,46 @@ mod tests {
     }
 
     #[test]
+    fn network_capabilities_distinguish_promptable_from_ready_connections() {
+        assert_eq!(
+            capabilities_for(NM_AP_FLAGS_PRIVACY, 0, NM_AP_SEC_KEY_MGMT_PSK),
+            expected_capabilities(true, false, true, true, true, false)
+        );
+    }
+
+    #[test]
+    fn network_capabilities_reject_unsaved_enterprise_connections() {
+        assert_eq!(
+            capabilities_for(NM_AP_FLAGS_PRIVACY, 0, NM_AP_SEC_KEY_MGMT_802_1X),
+            expected_capabilities(false, false, false, false, false, true)
+        );
+    }
+
+    #[test]
+    fn compatible_profile_matches_are_used_across_grouped_access_points() {
+        let mut first_ap = test_ap(NM_AP_FLAGS_PRIVACY, 0, NM_AP_SEC_KEY_MGMT_PSK);
+        first_ap.path = "/ap/1".to_string();
+        first_ap.strength = 80;
+        let mut second_ap = test_ap(NM_AP_FLAGS_PRIVACY, 0, NM_AP_SEC_KEY_MGMT_PSK);
+        second_ap.path = "/ap/2".to_string();
+        second_ap.strength = 40;
+        let profile = test_profile();
+        let matches =
+            std::collections::BTreeMap::from([(second_ap.path.clone(), vec![profile.clone()])]);
+
+        let [entry] = network_entries_with_profile_matches(vec![first_ap, second_ap], &matches)
+            .try_into()
+            .expect("one grouped network entry");
+
+        assert_eq!(
+            entry.primary_profile.as_ref().map(|profile| &profile.path),
+            Some(&profile.path)
+        );
+        assert!(entry.capabilities.can_connect_now);
+        assert!(!entry.capabilities.needs_password);
+    }
+
+    #[test]
     fn connectivity_status_maps_networkmanager_codes() {
         let portal = ConnectivityStatus::from_nm_code(2);
         assert_eq!(portal.state, "portal");
@@ -392,13 +688,35 @@ mod tests {
     }
 
     #[test]
+    fn connect_target_validation_rejects_bad_identity() {
+        let mut target = WifiConnectTarget {
+            ssid: "Example".to_string(),
+            ssid_bytes: b"Example".to_vec(),
+            ap_path: None,
+            bssid: Some("not-a-mac".to_string()),
+            ifname: None,
+            device_path: None,
+            connection_name: None,
+            private: false,
+            hidden: false,
+            security: None,
+        };
+        assert!(target.validate().is_err());
+
+        target.bssid = None;
+        target.ssid_bytes = vec![b'x'; 33];
+        assert!(target.validate().is_err());
+    }
+
+    #[test]
     fn connect_target_accepts_network_entry_path_alias() {
         let target: WifiConnectTarget = serde_json::from_str(
             r#"{
                 "ssid": "Cafe",
                 "ssid_bytes": [67, 97, 102, 101],
                 "path": "/org/freedesktop/NetworkManager/AccessPoint/1",
-                "bssid": "00:11:22:33:44:55"
+                "bssid": "00:11:22:33:44:55",
+                "device_iface": "wlan0"
             }"#,
         )
         .expect("target JSON");
@@ -410,6 +728,73 @@ mod tests {
             Some("/org/freedesktop/NetworkManager/AccessPoint/1")
         );
         assert_eq!(target.bssid.as_deref(), Some("00:11:22:33:44:55"));
+        assert_eq!(target.ifname.as_deref(), Some("wlan0"));
         assert!(!target.hidden);
+    }
+
+    fn capabilities_for(flags: u32, wpa_flags: u32, rsn_flags: u32) -> super::NetworkCapabilities {
+        let [entry] = network_entries(vec![test_ap(flags, wpa_flags, rsn_flags)], &[])
+            .try_into()
+            .expect("one entry");
+        entry.capabilities
+    }
+
+    fn expected_capabilities(
+        can_connect: bool,
+        can_connect_now: bool,
+        can_connect_with_password: bool,
+        needs_password: bool,
+        supported_auth: bool,
+        has_unsupported_reason: bool,
+    ) -> super::NetworkCapabilities {
+        super::NetworkCapabilities {
+            can_connect,
+            can_connect_now,
+            can_connect_with_password,
+            needs_password,
+            can_forget: false,
+            can_toggle_autoconnect: false,
+            supported_auth,
+            unsupported_reason: has_unsupported_reason.then(|| {
+                "unsupported authentication; only saved profiles, open/OWE, WEP, and WPA/SAE-Personal are supported".to_string()
+            }),
+        }
+    }
+
+    fn test_profile() -> SavedWifiConnection {
+        SavedWifiConnection {
+            path: "/profile/1".to_string(),
+            id: "Example".to_string(),
+            ssid: "Example".to_string(),
+            ssid_bytes: b"Example".to_vec(),
+            autoconnect: true,
+        }
+    }
+
+    fn test_ap(flags: u32, wpa_flags: u32, rsn_flags: u32) -> AccessPoint {
+        AccessPoint {
+            ssid: "Example".to_string(),
+            ssid_bytes: b"Example".to_vec(),
+            active: false,
+            security: security_label(flags, wpa_flags, rsn_flags),
+            strength: 50,
+            frequency: 2412,
+            channel: 1,
+            band: "2.4 GHz".to_string(),
+            mode: "Infra".to_string(),
+            max_bitrate_mbps: 0,
+            bandwidth_mhz: 0,
+            ssid_hex: "4578616d706c65".to_string(),
+            wpa_flags_label: security_flags_label(wpa_flags),
+            rsn_flags_label: security_flags_label(rsn_flags),
+            bssid: "00:11:22:33:44:55".to_string(),
+            last_seen: 0,
+            path: "/ap".to_string(),
+            device_path: "/device".to_string(),
+            device_iface: "wlan0".to_string(),
+            flags,
+            wpa_flags,
+            rsn_flags,
+        }
     }
 }

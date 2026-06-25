@@ -29,62 +29,74 @@ pub(crate) enum StreamOutput<'a> {
 }
 
 pub(crate) fn print_access_points_json(aps: &[AccessPoint]) -> Result<()> {
-    let text = serde_json::to_string_pretty(aps).context("serialize AP JSON")?;
-    println!("{text}");
-    Ok(())
+    print_pretty_json(aps, "serialize AP JSON")
 }
 
 pub(crate) fn print_network_entries_json(networks: &[NetworkEntry]) -> Result<()> {
-    let text = serde_json::to_string_pretty(networks).context("serialize network JSON")?;
-    println!("{text}");
-    Ok(())
+    print_pretty_json(networks, "serialize network JSON")
 }
 
 pub(crate) fn print_saved_wifi_connections_json(profiles: &[SavedWifiConnection]) -> Result<()> {
-    let text = serde_json::to_string_pretty(profiles).context("serialize saved Wi-Fi JSON")?;
-    println!("{text}");
-    Ok(())
+    print_pretty_json(profiles, "serialize saved Wi-Fi JSON")
 }
 
 pub(crate) fn print_connect_result(result: &ConnectResult, json: bool) -> Result<()> {
-    if json {
-        let text = serde_json::to_string_pretty(result).context("serialize connect result JSON")?;
-        println!("{text}");
-    } else {
-        println!("{}", result.message);
-    }
-    Ok(())
+    print_text_or_json(
+        result,
+        json,
+        &result.message,
+        "serialize connect result JSON",
+    )
 }
 
 pub(crate) fn print_connectivity(status: &ConnectivityStatus, json: bool) -> Result<()> {
     if json {
-        let text = serde_json::to_string_pretty(status).context("serialize connectivity JSON")?;
-        println!("{text}");
+        print_pretty_json(status, "serialize connectivity JSON")
     } else {
         println!("{}", status.state);
+        Ok(())
     }
-    Ok(())
 }
 
 pub(crate) fn print_wifi_status(status: &WifiStatus, json: bool) -> Result<()> {
     if json {
-        let text = serde_json::to_string_pretty(status).context("serialize Wi-Fi status JSON")?;
-        println!("{text}");
-    } else if let Some(access_point) = &status.access_point {
-        println!("{}", access_point.ssid);
+        print_pretty_json(status, "serialize Wi-Fi status JSON")
+    } else {
+        if let Some(access_point) = &status.access_point {
+            println!("{}", access_point.ssid);
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 pub(crate) fn print_disconnect_result(result: &DisconnectResult, json: bool) -> Result<()> {
-    if json {
-        let text =
-            serde_json::to_string_pretty(result).context("serialize disconnect result JSON")?;
-        println!("{text}");
-    } else {
-        println!("{}", result.message);
+    match json {
+        true => print_pretty_json(result, "serialize disconnect result JSON"),
+        false => {
+            println!("{}", result.message);
+            Ok(())
+        }
     }
+}
+
+fn print_pretty_json<T: Serialize + ?Sized>(value: &T, context: &'static str) -> Result<()> {
+    let text = serde_json::to_string_pretty(value).context(context)?;
+    println!("{text}");
     Ok(())
+}
+
+fn print_text_or_json<T: Serialize + ?Sized>(
+    value: &T,
+    json: bool,
+    text: &str,
+    context: &'static str,
+) -> Result<()> {
+    if json {
+        print_pretty_json(value, context)
+    } else {
+        println!("{text}");
+        Ok(())
+    }
 }
 
 pub(crate) fn print_saved_wifi_connections(profiles: &[SavedWifiConnection]) {

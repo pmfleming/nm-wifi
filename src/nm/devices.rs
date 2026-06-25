@@ -4,7 +4,10 @@ use anyhow::{Context, Result};
 use zvariant::OwnedObjectPath;
 
 use super::{AP_IFACE, DEVICE_IFACE, NM_DEVICE_TYPE_WIFI, NM_IFACE, NM_PATH, Nm, WIFI_IFACE};
-use crate::model::{AccessPoint, WifiConnectTarget, WifiDevice, display_ssid, security_label};
+use crate::model::{
+    AccessPoint, WifiConnectTarget, WifiDevice, display_ssid, frequency_band, frequency_channel,
+    security_flags_label, security_label, ssid_hex, wifi_mode_label,
+};
 
 impl Nm {
     pub(crate) fn wifi_devices(&self) -> Result<Vec<WifiDevice>> {
@@ -48,7 +51,7 @@ impl Nm {
 
     pub(crate) fn active_ssid_matches(&self, target: &WifiConnectTarget) -> Result<bool> {
         let target_ssid = target.ssid_bytes();
-        for device in self.wifi_devices()? {
+        for device in self.wifi_devices_for_target(target)? {
             let Some(active_path) = self.active_access_point(&device)? else {
                 continue;
             };
@@ -71,7 +74,7 @@ impl Nm {
         target: &WifiConnectTarget,
     ) -> Result<Option<(WifiDevice, OwnedObjectPath, AccessPoint)>> {
         let target_ssid = target.ssid_bytes();
-        for device in self.wifi_devices()? {
+        for device in self.wifi_devices_for_target(target)? {
             for path in self.device_access_points(&device)? {
                 let Ok(ap) = self.access_point(&device.path, &path, false) else {
                     continue;
@@ -97,6 +100,17 @@ impl Nm {
         Ok(None)
     }
 
+    pub(super) fn wifi_devices_for_target(
+        &self,
+        target: &WifiConnectTarget,
+    ) -> Result<Vec<WifiDevice>> {
+        Ok(self
+            .wifi_devices()?
+            .into_iter()
+            .filter(|device| target_matches_device(target, device))
+            .collect())
+    }
+
     pub(crate) fn list_access_points(&self) -> Result<Vec<AccessPoint>> {
         let mut by_ssid = BTreeMap::new();
         for device in self.wifi_devices()? {
@@ -106,6 +120,25 @@ impl Nm {
         tracing::debug!(
             count = aps.len(),
             "listed visible Wi-Fi networks after SSID deduplication"
+        );
+        Ok(aps)
+    }
+
+    pub(crate) fn list_all_access_points(&self) -> Result<Vec<AccessPoint>> {
+        let mut aps = Vec::new();
+        for device in self.wifi_devices()? {
+            let active_path = self.active_access_point(&device)?;
+            for path in self.device_access_points(&device)? {
+                let active = active_path.as_ref().is_some_and(|active| *active == path);
+                if let Some(ap) = self.read_visible_access_point(&device.path, &path, active) {
+                    aps.push(ap);
+                }
+            }
+        }
+        sort_access_points_nmcli_like(&mut aps);
+        tracing::debug!(
+            count = aps.len(),
+            "listed exact visible Wi-Fi access points"
         );
         Ok(aps)
     }
@@ -158,6 +191,12 @@ impl Nm {
         }
     }
 
+    fn device_iface(&self, device_path: &OwnedObjectPath) -> Option<String> {
+        self.proxy_path(device_path, DEVICE_IFACE)
+            .and_then(|device| device.get_property("Interface").context("read Interface"))
+            .ok()
+    }
+
     pub(super) fn access_point(
         &self,
         device_path: &OwnedObjectPath,
@@ -172,22 +211,46 @@ impl Nm {
         let wpa_flags = ap.get_property("WpaFlags").unwrap_or(0);
         let rsn_flags = ap.get_property("RsnFlags").unwrap_or(0);
 
+        let frequency = ap.get_property("Frequency").unwrap_or(0);
+        let mode = ap.get_property("Mode").unwrap_or(0);
         Ok(AccessPoint {
             ssid: display_ssid(&ssid_bytes),
+            ssid_hex: ssid_hex(&ssid_bytes),
             ssid_bytes,
             active,
             security: security_label(flags, wpa_flags, rsn_flags),
             strength: ap.get_property("Strength").unwrap_or(0),
-            frequency: ap.get_property("Frequency").unwrap_or(0),
+            frequency,
+            channel: frequency_channel(frequency),
+            band: frequency_band(frequency).to_string(),
+            mode: wifi_mode_label(mode).to_string(),
+            max_bitrate_mbps: ap.get_property::<u32>("MaxBitrate").unwrap_or(0) / 1000,
+            bandwidth_mhz: ap.get_property("Bandwidth").unwrap_or(0),
+            wpa_flags_label: security_flags_label(wpa_flags),
+            rsn_flags_label: security_flags_label(rsn_flags),
             bssid: ap.get_property("HwAddress").unwrap_or_default(),
             last_seen: ap.get_property("LastSeen").unwrap_or(-1),
             path: path.to_string(),
             device_path: device_path.to_string(),
+            device_iface: self.device_iface(device_path).unwrap_or_default(),
             flags,
             wpa_flags,
             rsn_flags,
         })
     }
+}
+
+fn target_matches_device(target: &WifiConnectTarget, device: &WifiDevice) -> bool {
+    target
+        .device_path
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .is_none_or(|path| device.path.as_str() == path)
+        && target
+            .ifname
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .is_none_or(|ifname| device.iface == ifname)
 }
 
 fn access_point_matches(
@@ -231,6 +294,21 @@ fn sorted_access_points(by_ssid: BTreeMap<Vec<u8>, AccessPoint>) -> Vec<AccessPo
     aps
 }
 
+fn sort_access_points_nmcli_like(aps: &mut [AccessPoint]) {
+    aps.sort_by(|a, b| {
+        crate::model::ap_uses_wep(a.flags, a.wpa_flags, a.rsn_flags)
+            .cmp(&crate::model::ap_uses_wep(
+                b.flags,
+                b.wpa_flags,
+                b.rsn_flags,
+            ))
+            .then_with(|| b.strength.cmp(&a.strength))
+            .then_with(|| a.frequency.cmp(&b.frequency))
+            .then_with(|| b.max_bitrate_mbps.cmp(&a.max_bitrate_mbps))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::access_point_matches;
@@ -268,10 +346,19 @@ mod tests {
             security: "WPA2/3".to_string(),
             strength: 80,
             frequency: 2412,
+            channel: 1,
+            band: "2.4 GHz".to_string(),
+            mode: "Infra".to_string(),
+            max_bitrate_mbps: 0,
+            bandwidth_mhz: 0,
+            ssid_hex: "4578616d706c65".to_string(),
+            wpa_flags_label: "(none)".to_string(),
+            rsn_flags_label: "(none)".to_string(),
             bssid: "00:11:22:33:44:55".to_string(),
             last_seen: 0,
             path: "/ap/1".to_string(),
             device_path: "/device/1".to_string(),
+            device_iface: "wlan0".to_string(),
             flags: 0,
             wpa_flags: 0,
             rsn_flags: 0,

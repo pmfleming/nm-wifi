@@ -1,5 +1,6 @@
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -77,7 +78,17 @@ pub(crate) fn write_complete(timed_out: bool, networks_found: usize) -> Result<(
 }
 
 pub(crate) fn read_snapshot() -> Result<Option<CachedSnapshot>> {
-    read_json(snapshot_path())
+    let Some(snapshot) = read_json::<CachedSnapshot>(snapshot_path())? else {
+        return Ok(None);
+    };
+    if snapshot.version != CACHE_VERSION {
+        warn_cache_ignored(format!(
+            "cache version {} is stale; expected {CACHE_VERSION}",
+            snapshot.version
+        ));
+        return Ok(None);
+    }
+    Ok(Some(snapshot))
 }
 
 fn write_session_snapshot(scanning: bool, networks: &[AccessPoint]) -> Result<()> {
@@ -109,10 +120,20 @@ where
     if !path.exists() {
         return Ok(None);
     }
-    let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    serde_json::from_str(&text)
-        .with_context(|| format!("parse {}", path.display()))
-        .map(Some)
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) => {
+            warn_cache_ignored(format!("could not read {}: {err}", path.display()));
+            return Ok(None);
+        }
+    };
+    match serde_json::from_str(&text) {
+        Ok(value) => Ok(Some(value)),
+        Err(err) => {
+            warn_cache_ignored(format!("could not parse {}: {err}", path.display()));
+            Ok(None)
+        }
+    }
 }
 
 fn write_json<T>(path: PathBuf, value: &T) -> Result<()>
@@ -120,16 +141,16 @@ where
     T: Serialize,
 {
     let parent = path.parent().context("cache path has no parent")?;
-    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    create_private_dir_all(parent)?;
     let tmp_path = temp_path_for(&path)?;
     let text = serde_json::to_string_pretty(value).context("serialize cache JSON")?;
-    fs::write(&tmp_path, format!("{text}\n"))
+    write_private_file(&tmp_path, format!("{text}\n").as_bytes())
         .with_context(|| format!("write {}", tmp_path.display()))?;
     fs::rename(&tmp_path, &path)
         .with_context(|| format!("rename {} to {}", tmp_path.display(), path.display()))
 }
 
-fn temp_path_for(path: &std::path::Path) -> Result<PathBuf> {
+fn temp_path_for(path: &Path) -> Result<PathBuf> {
     let parent = path.parent().context("cache path has no parent")?;
     let file_name = path
         .file_name()
@@ -141,6 +162,99 @@ fn temp_path_for(path: &std::path::Path) -> Result<PathBuf> {
         std::process::id(),
         counter
     )))
+}
+
+pub(crate) fn create_private_dir_all(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        create_private_dir_all_unix(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))
+    }
+}
+
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    file.write_all(contents)
+        .with_context(|| format!("write {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 0600 {}", path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_private_dir_all_unix(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    match fs::symlink_metadata(path) {
+        Ok(link_metadata) => {
+            if link_metadata.file_type().is_symlink() {
+                anyhow::bail!(
+                    "refusing to use symlinked cache directory {}",
+                    path.display()
+                );
+            }
+            let metadata =
+                fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+            if !metadata.is_dir() {
+                anyhow::bail!("{} exists but is not a directory", path.display());
+            }
+            let current_uid = current_euid();
+            if metadata.uid() != current_uid {
+                anyhow::bail!(
+                    "refusing to use {} owned by uid {}; expected uid {}",
+                    path.display(),
+                    metadata.uid(),
+                    current_uid
+                );
+            }
+            if metadata.mode() & 0o077 != 0 {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                    .with_context(|| format!("chmod 0700 {}", path.display()))?;
+            }
+            return Ok(());
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err).with_context(|| format!("lstat {}", path.display())),
+    }
+
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder
+        .create(path)
+        .with_context(|| format!("create {}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod 0700 {}", path.display()))
+}
+
+#[cfg(unix)]
+fn current_euid() -> u32 {
+    unsafe { geteuid() }
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn geteuid() -> u32;
+}
+
+fn warn_cache_ignored(message: String) {
+    tracing::warn!(message = %message, "ignoring Wi-Fi cache");
+    eprintln!("warning: ignoring Wi-Fi cache: {message}");
 }
 
 fn snapshot_path() -> PathBuf {
@@ -160,10 +274,21 @@ pub(crate) fn log_path() -> PathBuf {
 }
 
 fn cache_dir() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join(CACHE_DIR_NAME)
+    match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(runtime_dir) => PathBuf::from(runtime_dir).join(CACHE_DIR_NAME),
+        None => std::env::temp_dir().join(format!("{CACHE_DIR_NAME}-{}", current_user_id())),
+    }
+}
+
+fn current_user_id() -> u32 {
+    #[cfg(unix)]
+    {
+        current_euid()
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
 }
 
 pub(crate) fn now_ms() -> u128 {

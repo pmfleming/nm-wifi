@@ -67,6 +67,12 @@ pub(crate) enum Command {
         /// Write latest snapshot/status files under $XDG_RUNTIME_DIR/nm-wifi.
         #[arg(long)]
         cache: bool,
+        /// Restrict scan to a Wi-Fi interface.
+        #[arg(long)]
+        ifname: Option<String>,
+        /// Request a targeted scan for an SSID. May be repeated.
+        #[arg(long = "ssid")]
+        ssids: Vec<String>,
     },
     /// Connect to an SSID using the current nmcli activation fallback.
     Connect {
@@ -75,6 +81,9 @@ pub(crate) enum Command {
         /// Password for creating a new WPA/WPA2/WPA3-Personal connection over D-Bus.
         #[arg(long)]
         password: Option<String>,
+        /// Read the Wi-Fi password from the first line of stdin instead of argv.
+        #[arg(long, conflicts_with = "password")]
+        password_stdin: bool,
         /// Restrict connection to a visible BSSID.
         #[arg(long)]
         bssid: Option<String>,
@@ -95,6 +104,9 @@ pub(crate) enum Command {
         /// Password for creating a new WPA/WPA2/WPA3-Personal connection over D-Bus.
         #[arg(long)]
         password: Option<String>,
+        /// Read the Wi-Fi password from the first line of stdin instead of argv.
+        #[arg(long, conflicts_with = "password")]
+        password_stdin: bool,
         /// Interpret password as a WEP key or WEP passphrase.
         #[arg(long, value_enum)]
         wep_key_type: Option<WepKeyType>,

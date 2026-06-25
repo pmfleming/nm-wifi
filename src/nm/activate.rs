@@ -5,7 +5,9 @@ use super::wifi_settings::{
     hidden_wifi_connection_settings, psk_key_mgmt, psk_wifi_connection_settings,
     wep_wifi_connection_settings,
 };
-use super::{ACTIVE_CONNECTION_IFACE, ConnectionSettings, DEVICE_IFACE, NM_IFACE, NM_PATH, Nm};
+use super::{
+    ACTIVE_CONNECTION_IFACE, ConnectionSettings, DEVICE_IFACE, NM_IFACE, NM_PATH, Nm, owned_value,
+};
 use crate::model::{
     WepKeyType, WifiConnectTarget, ap_is_passwordless, ap_supports_psk, ap_uses_wep,
 };
@@ -14,7 +16,13 @@ impl Nm {
     pub(crate) fn activate_saved_wifi_connection_for(
         &self,
         target: &WifiConnectTarget,
+        password: Option<&str>,
+        _wep_key_type: Option<WepKeyType>,
     ) -> Result<bool> {
+        if password.is_some() {
+            tracing::info!(ssid = %target.ssid, "skipping saved-profile activation because caller supplied a password");
+            return Ok(false);
+        }
         let Some((connection_path, device_path, specific_object)) =
             self.saved_wifi_activation_target_for(target)?
         else {
@@ -63,7 +71,7 @@ impl Nm {
             rsn_flags = ap.rsn_flags,
             "preparing D-Bus add-and-activate for visible Wi-Fi network"
         );
-        let settings = if ap_is_passwordless(ap.flags, ap.wpa_flags, ap.rsn_flags) {
+        let mut settings = if ap_is_passwordless(ap.flags, ap.wpa_flags, ap.rsn_flags) {
             tracing::debug!(ssid = %target.ssid, "network is passwordless");
             ConnectionSettings::new()
         } else if ap_supports_psk(ap.wpa_flags, ap.rsn_flags) {
@@ -85,6 +93,7 @@ impl Nm {
             return Ok(None);
         };
 
+        apply_target_connection_metadata(&mut settings, target)?;
         self.add_and_activate(&target.ssid, settings, device.path, ap_path)
             .map(Some)
     }
@@ -95,11 +104,12 @@ impl Nm {
         password: Option<&str>,
         wep_key_type: Option<WepKeyType>,
     ) -> Result<Option<OwnedObjectPath>> {
-        let Some(device) = self.wifi_devices()?.into_iter().next() else {
+        let Some(device) = self.wifi_devices_for_target(target)?.into_iter().next() else {
             return Ok(None);
         };
         self.request_hidden_scan(&device, target.ssid_bytes().as_ref())?;
-        let settings = hidden_wifi_connection_settings(target, password, wep_key_type)?;
+        let mut settings = hidden_wifi_connection_settings(target, password, wep_key_type)?;
+        apply_target_connection_metadata(&mut settings, target)?;
         self.add_and_activate(&target.ssid, settings, device.path, root_object_path()?)
             .map(Some)
     }
@@ -129,7 +139,7 @@ impl Nm {
         let device = if let Some((device, _ap_path, _ap)) = self.visible_access_point_for(target)? {
             device
         } else {
-            let Some(device) = self.wifi_devices()?.into_iter().next() else {
+            let Some(device) = self.wifi_devices_for_target(target)?.into_iter().next() else {
                 return Ok(None);
             };
             device
@@ -172,6 +182,43 @@ impl Nm {
             })
             .ok()
     }
+}
+
+fn apply_target_connection_metadata(
+    settings: &mut ConnectionSettings,
+    target: &WifiConnectTarget,
+) -> Result<()> {
+    if target.connection_name.is_none() && !target.private {
+        return Ok(());
+    }
+    let connection = settings.entry("connection".to_string()).or_default();
+    if let Some(name) = target
+        .connection_name
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        connection.insert("id".to_string(), owned_value(name.to_string())?);
+        connection
+            .entry("type".to_string())
+            .or_insert(owned_value("802-11-wireless".to_string())?);
+    }
+    if target.private
+        && let Some(user) = current_user_name()
+    {
+        connection.insert(
+            "permissions".to_string(),
+            owned_value(vec![format!("user:{user}:")])?,
+        );
+    }
+    Ok(())
+}
+
+fn current_user_name() -> Option<String> {
+    std::env::var("USER")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var("LOGNAME").ok())
+        .filter(|value| !value.is_empty())
 }
 
 fn root_object_path() -> Result<OwnedObjectPath> {

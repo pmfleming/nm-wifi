@@ -16,7 +16,9 @@ pub(super) fn psk_wifi_connection_settings(
     if key_mgmt == "wpa-psk" {
         validate_wpa_psk(password)?;
     }
-    wireless_security_settings(key_mgmt, password)
+    Ok(security_connection_settings(wireless_security_section(
+        key_mgmt, password,
+    )?))
 }
 
 pub(super) fn hidden_wifi_connection_settings(
@@ -84,12 +86,6 @@ fn base_wifi_connection_settings(
             HashMap::from([("method".to_string(), owned_value("auto".to_string())?)]),
         ),
     ]))
-}
-
-fn wireless_security_settings(key_mgmt: &str, password: &str) -> Result<ConnectionSettings> {
-    Ok(security_connection_settings(wireless_security_section(
-        key_mgmt, password,
-    )?))
 }
 
 fn security_connection_settings(section: HashMap<String, OwnedValue>) -> ConnectionSettings {
@@ -218,10 +214,19 @@ mod tests {
             security: "WPA2/3".to_string(),
             strength: 50,
             frequency: 2412,
+            channel: 1,
+            band: "2.4 GHz".to_string(),
+            mode: "Infra".to_string(),
+            max_bitrate_mbps: 0,
+            bandwidth_mhz: 0,
+            ssid_hex: "4578616d706c65".to_string(),
+            wpa_flags_label: "(none)".to_string(),
+            rsn_flags_label: "(none)".to_string(),
             bssid: "00:11:22:33:44:55".to_string(),
             last_seen: 0,
             path: "/ap".to_string(),
             device_path: "/device".to_string(),
+            device_iface: "wlan0".to_string(),
             flags: 0,
             wpa_flags: 0,
             rsn_flags,

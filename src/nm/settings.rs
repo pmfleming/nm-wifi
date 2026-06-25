@@ -7,7 +7,10 @@ use super::{
     ConnectionSettings, DEVICE_IFACE, Nm, SETTINGS_CONNECTION_IFACE, SETTINGS_IFACE, SETTINGS_PATH,
     owned_value,
 };
-use crate::model::{SavedWifiConnection, WifiConnectTarget, WifiDevice, display_ssid};
+use crate::model::{
+    AccessPoint, NetworkEntry, SavedWifiConnection, WifiConnectTarget, WifiDevice, display_ssid,
+    network_entries_with_profile_matches,
+};
 
 impl Nm {
     pub(super) fn saved_wifi_activation_target_for(
@@ -15,9 +18,9 @@ impl Nm {
         target: &WifiConnectTarget,
     ) -> Result<Option<(OwnedObjectPath, OwnedObjectPath, OwnedObjectPath)>> {
         if !target.hidden
-            && let Some((device, ap_path, _ap)) = self.visible_access_point_for(target)?
-            && let Some(connection_path) = self
-                .saved_wifi_connection_for_ssid_on_device(target.ssid_bytes().as_ref(), &device)?
+            && let Some((device, ap_path, ap)) = self.visible_access_point_for(target)?
+            && let Some(connection_path) =
+                self.saved_wifi_connection_for_ap_on_device(&ap, &device)?
         {
             tracing::info!(ssid = %target.ssid, iface = %device.iface, "using saved Wi-Fi profile for selected access point");
             return Ok(Some((connection_path, device.path, ap_path)));
@@ -33,8 +36,8 @@ impl Nm {
         else {
             return Ok(None);
         };
-        let Some(device) = self.wifi_devices()?.into_iter().next() else {
-            bail!("no Wi-Fi devices found");
+        let Some(device) = self.wifi_devices_for_target(target)?.into_iter().next() else {
+            bail!("no matching Wi-Fi device found");
         };
         Ok(Some((connection_path, device.path, root_object_path()?)))
     }
@@ -79,13 +82,79 @@ impl Nm {
         Ok(connections)
     }
 
-    fn saved_wifi_connection_for_ssid_on_device(
+    pub(crate) fn network_entries_for_access_points(
         &self,
-        ssid_bytes: &[u8],
+        access_points: Vec<AccessPoint>,
+    ) -> Result<Vec<NetworkEntry>> {
+        let profile_matches = self.compatible_profile_matches_by_ap_path(&access_points)?;
+        Ok(network_entries_with_profile_matches(
+            access_points,
+            &profile_matches,
+        ))
+    }
+
+    fn compatible_profile_matches_by_ap_path(
+        &self,
+        access_points: &[AccessPoint],
+    ) -> Result<std::collections::BTreeMap<String, Vec<SavedWifiConnection>>> {
+        let profiles_by_path = self
+            .saved_wifi_connections()?
+            .into_iter()
+            .map(|profile| (profile.path.clone(), profile))
+            .collect::<HashMap<_, _>>();
+        let mut matches = std::collections::BTreeMap::new();
+        for access_point in access_points {
+            self.add_compatible_profile_matches(access_point, &profiles_by_path, &mut matches);
+        }
+        Ok(matches)
+    }
+
+    fn add_compatible_profile_matches(
+        &self,
+        access_point: &AccessPoint,
+        profiles_by_path: &HashMap<String, SavedWifiConnection>,
+        matches: &mut std::collections::BTreeMap<String, Vec<SavedWifiConnection>>,
+    ) {
+        let Ok(device_path) = OwnedObjectPath::try_from(access_point.device_path.as_str()) else {
+            tracing::warn!(device_path = %access_point.device_path, ap_path = %access_point.path, "skipping AP profile compatibility check with invalid device path");
+            return;
+        };
+        let device = WifiDevice {
+            path: device_path,
+            iface: access_point.device_iface.clone(),
+        };
+        let available = match self.available_connections(&device) {
+            Ok(available) => available,
+            Err(err) => {
+                tracing::warn!(iface = %device.iface, error = %format_args!("{err:#}"), "could not read AvailableConnections for AP profile compatibility");
+                return;
+            }
+        };
+        for path in available {
+            match self.connection_matches_access_point(&path, access_point) {
+                Ok(true) => {
+                    if let Some(profile) = profiles_by_path.get(&path.to_string()) {
+                        matches
+                            .entry(access_point.path.clone())
+                            .or_default()
+                            .push(profile.clone());
+                    }
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(connection = %path, error = %format_args!("{err:#}"), "could not check saved profile compatibility")
+                }
+            }
+        }
+    }
+
+    fn saved_wifi_connection_for_ap_on_device(
+        &self,
+        ap: &AccessPoint,
         device: &WifiDevice,
     ) -> Result<Option<OwnedObjectPath>> {
         for path in self.available_connections(device)? {
-            if self.connection_matches_ssid(&path, ssid_bytes)? {
+            if self.connection_matches_access_point(&path, ap)? {
                 return Ok(Some(path));
             }
         }
@@ -104,6 +173,15 @@ impl Nm {
     fn connection_matches_ssid(&self, path: &OwnedObjectPath, ssid_bytes: &[u8]) -> Result<bool> {
         let settings = self.connection_settings(path)?;
         Ok(settings_match_wifi_ssid(&settings, ssid_bytes))
+    }
+
+    fn connection_matches_access_point(
+        &self,
+        path: &OwnedObjectPath,
+        ap: &AccessPoint,
+    ) -> Result<bool> {
+        let settings = self.connection_settings(path)?;
+        Ok(settings_match_access_point(&settings, ap))
     }
 
     fn saved_connections(&self) -> Result<Vec<OwnedObjectPath>> {
@@ -161,20 +239,42 @@ fn saved_wifi_connection_from_settings(
 }
 
 fn settings_match_wifi_ssid(settings: &ConnectionSettings, ssid_bytes: &[u8]) -> bool {
-    let Some(wireless) = settings.get("802-11-wireless") else {
+    let Some(wireless) = wifi_settings_section(settings) else {
         return false;
     };
+    wireless
+        .get("ssid")
+        .and_then(setting_bytes)
+        .is_some_and(|saved_ssid| ssid_bytes_match(&saved_ssid, ssid_bytes))
+}
+
+fn settings_match_access_point(settings: &ConnectionSettings, ap: &AccessPoint) -> bool {
+    let Some(wireless) = wifi_settings_section(settings) else {
+        return false;
+    };
+    if !wireless
+        .get("ssid")
+        .and_then(setting_bytes)
+        .is_some_and(|saved_ssid| ssid_bytes_match(&saved_ssid, ap.ssid_bytes().as_ref()))
+    {
+        return false;
+    }
+    wireless
+        .get("bssid")
+        .and_then(setting_bytes)
+        .is_none_or(|saved_bssid| bssid_bytes_match(&saved_bssid, &ap.bssid))
+}
+
+fn wifi_settings_section(settings: &ConnectionSettings) -> Option<&HashMap<String, OwnedValue>> {
+    let wireless = settings.get("802-11-wireless")?;
     if settings
         .get("connection")
         .and_then(|connection| setting_string(connection, "type"))
         .is_some_and(|connection_type| connection_type != "802-11-wireless")
     {
-        return false;
+        return None;
     }
-    wireless
-        .get("ssid")
-        .and_then(setting_bytes)
-        .is_some_and(|saved_ssid| ssid_bytes_match(&saved_ssid, ssid_bytes))
+    Some(wireless)
 }
 
 fn setting_string(settings: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
@@ -195,6 +295,18 @@ fn setting_bytes(value: &OwnedValue) -> Option<Vec<u8>> {
 
 fn ssid_bytes_match(saved_ssid: &[u8], ssid_bytes: &[u8]) -> bool {
     saved_ssid == ssid_bytes
+}
+
+fn bssid_bytes_match(saved_bssid: &[u8], ap_bssid: &str) -> bool {
+    parse_bssid(ap_bssid).is_some_and(|ap_bssid| saved_bssid == ap_bssid)
+}
+
+fn parse_bssid(value: &str) -> Option<Vec<u8>> {
+    let bytes: Option<Vec<_>> = value
+        .split([':', '-'])
+        .map(|part| u8::from_str_radix(part, 16).ok())
+        .collect();
+    bytes.filter(|bytes| bytes.len() == 6)
 }
 
 fn root_object_path() -> Result<OwnedObjectPath> {

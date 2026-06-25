@@ -17,7 +17,16 @@ impl Nm {
             cache = options.cache,
             "starting streaming Wi-Fi scan"
         );
-        let devices = self.wifi_devices()?;
+        let devices = self
+            .wifi_devices()?
+            .into_iter()
+            .filter(|device| {
+                options
+                    .ifname
+                    .as_deref()
+                    .is_none_or(|ifname| device.iface == ifname)
+            })
+            .collect::<Vec<_>>();
         if devices.is_empty() {
             return emit_empty_device_stream(self, options.cache);
         }
@@ -63,6 +72,7 @@ impl<'a> ScanSession<'a> {
         devices: Vec<WifiDevice>,
         options: ScanStreamOptions,
     ) -> Self {
+        let deadline = Instant::now() + options.timeout;
         Self {
             nm,
             rx,
@@ -79,7 +89,7 @@ impl<'a> ScanSession<'a> {
                 })
                 .collect(),
             options,
-            deadline: Instant::now() + options.timeout,
+            deadline,
             last_status: Instant::now(),
             networks_found: 0,
             timed_out: false,
@@ -128,7 +138,10 @@ impl<'a> ScanSession<'a> {
 
     fn try_request_scan(&mut self, index: usize, now: Instant, max_attempts: u32) -> Result<()> {
         self.states[index].attempts += 1;
-        match self.nm.request_scan(&self.states[index].device) {
+        match self
+            .nm
+            .request_scan_for_ssids(&self.states[index].device, &self.options.ssid_bytes)
+        {
             Ok(()) => self.note_scan_requested(index, max_attempts),
             Err(err) => self.note_scan_request_failed(index, now, max_attempts, err),
         }
@@ -140,8 +153,10 @@ impl<'a> ScanSession<'a> {
         state.request_succeeded = true;
         emit_status(
             format!(
-                "requested scan on {} (attempt {}/{max_attempts})",
-                state.device.iface, state.attempts
+                "requested scan on {} (attempt {}/{max_attempts}, {} target SSIDs)",
+                state.device.iface,
+                state.attempts,
+                self.options.ssid_bytes.len()
             ),
             self.options.cache,
         )
