@@ -22,6 +22,8 @@ nm-wifi connect-target '{"ssid":"Cafe","ssid_bytes":[67,97,102,101],"path":"/org
 nm-wifi saved --json
 nm-wifi profile delete <path>
 nm-wifi profile autoconnect <path> true|false
+nm-wifi status --json
+nm-wifi disconnect --json
 nm-wifi connectivity --json
 nm-wifi active
 ```
@@ -29,6 +31,8 @@ nm-wifi active
 `networks --json` enriches visible access points with saved-profile matches and backend connection capabilities for UI frontends. `connect-target` accepts one of those JSON objects directly, preserving exact SSID bytes and AP object paths. Add `--json` to `connect` or `connect-target` to emit a structured connection result with connectivity state and portal recommendation.
 
 `scan --stream` emits JSON Lines progress events and repeated enriched snapshots as NetworkManager adds/removes access points. Add `--cache` to write `latest.json`, `scan-session.json`, and `status.json` under `$XDG_RUNTIME_DIR/nm-wifi`.
+
+`status --json` reports the active Wi-Fi access point, matching saved profile, connectivity, IPv4 details, and wireless link details where NetworkManager exposes them. `disconnect --json` deactivates the active Wi-Fi connection if one exists.
 
 Prefer `--json` for stable machine-readable output. JSON includes display SSIDs plus raw `ssid_bytes`; plain TSV output is intended for humans and escapes tabs, newlines, backslashes, NUL, and control characters.
 

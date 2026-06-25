@@ -10,6 +10,7 @@ mod connectivity;
 mod devices;
 mod scan;
 mod settings;
+mod status;
 mod wifi_settings;
 
 pub(crate) const NM_DEST: &str = "org.freedesktop.NetworkManager";

@@ -4,7 +4,8 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::model::{
-    AccessPoint, ConnectResult, ConnectivityStatus, NetworkEntry, SavedWifiConnection,
+    AccessPoint, ConnectResult, ConnectivityStatus, DisconnectResult, NetworkEntry,
+    SavedWifiConnection, WifiStatus,
 };
 
 #[derive(Serialize)]
@@ -61,6 +62,27 @@ pub(crate) fn print_connectivity(status: &ConnectivityStatus, json: bool) -> Res
         println!("{text}");
     } else {
         println!("{}", status.state);
+    }
+    Ok(())
+}
+
+pub(crate) fn print_wifi_status(status: &WifiStatus, json: bool) -> Result<()> {
+    if json {
+        let text = serde_json::to_string_pretty(status).context("serialize Wi-Fi status JSON")?;
+        println!("{text}");
+    } else if let Some(access_point) = &status.access_point {
+        println!("{}", access_point.ssid);
+    }
+    Ok(())
+}
+
+pub(crate) fn print_disconnect_result(result: &DisconnectResult, json: bool) -> Result<()> {
+    if json {
+        let text =
+            serde_json::to_string_pretty(result).context("serialize disconnect result JSON")?;
+        println!("{text}");
+    } else {
+        println!("{}", result.message);
     }
     Ok(())
 }

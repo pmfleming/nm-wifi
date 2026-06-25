@@ -9,7 +9,8 @@ use crate::model::{ScanStreamOptions, WifiConnectTarget, network_entries};
 use crate::nm::Nm;
 use crate::output::{
     print_access_points, print_access_points_json, print_connect_result, print_connectivity,
-    print_network_entries_json, print_saved_wifi_connections, print_saved_wifi_connections_json,
+    print_disconnect_result, print_network_entries_json, print_saved_wifi_connections,
+    print_saved_wifi_connections_json, print_wifi_status,
 };
 
 mod cache;
@@ -88,6 +89,8 @@ fn main() -> Result<()> {
         )?,
         Command::Saved { json } => print_saved_profiles(&nm, json)?,
         Command::Profile { command } => run_profile_command(&nm, command)?,
+        Command::Status { json } => print_wifi_status(&nm.wifi_status()?, json)?,
+        Command::Disconnect { json } => print_disconnect_result(&nm.disconnect_wifi()?, json)?,
         Command::Connectivity { json } => print_connectivity(&nm.connectivity_check()?, json)?,
         Command::Active => print_active_ssid(&nm)?,
     }

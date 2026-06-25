@@ -125,7 +125,10 @@ impl Nm {
         Ok(())
     }
 
-    fn active_access_point(&self, device: &WifiDevice) -> Result<Option<OwnedObjectPath>> {
+    pub(super) fn active_access_point(
+        &self,
+        device: &WifiDevice,
+    ) -> Result<Option<OwnedObjectPath>> {
         let wifi = self.proxy_path(&device.path, WIFI_IFACE)?;
         let active_path: OwnedObjectPath = wifi
             .get_property("ActiveAccessPoint")
@@ -155,7 +158,7 @@ impl Nm {
         }
     }
 
-    fn access_point(
+    pub(super) fn access_point(
         &self,
         device_path: &OwnedObjectPath,
         path: &OwnedObjectPath,

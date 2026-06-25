@@ -29,6 +29,40 @@ pub(crate) struct ConnectResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub(crate) struct DisconnectResult {
+    pub(crate) status: &'static str,
+    pub(crate) message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct WifiStatus {
+    pub(crate) active: bool,
+    pub(crate) device_iface: Option<String>,
+    pub(crate) active_connection_path: Option<String>,
+    pub(crate) access_point: Option<AccessPoint>,
+    pub(crate) network: Option<NetworkEntry>,
+    pub(crate) profile: Option<SavedWifiConnection>,
+    pub(crate) connectivity: Option<ConnectivityStatus>,
+    pub(crate) ip4: Option<Ip4Status>,
+    pub(crate) wireless: Option<WirelessStatus>,
+    pub(crate) active_since_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct Ip4Status {
+    pub(crate) address: Option<String>,
+    pub(crate) prefix: Option<u32>,
+    pub(crate) gateway: Option<String>,
+    pub(crate) dns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct WirelessStatus {
+    pub(crate) bitrate_mbps: Option<u32>,
+    pub(crate) mac_address: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct ConnectivityStatus {
     pub(crate) code: u32,
     pub(crate) state: &'static str,

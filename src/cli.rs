@@ -113,6 +113,18 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: ProfileCommand,
     },
+    /// Show active Wi-Fi status and connection details.
+    Status {
+        /// Emit JSON instead of plain active SSID text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Disconnect the active Wi-Fi connection, if any.
+    Disconnect {
+        /// Emit structured JSON result.
+        #[arg(long)]
+        json: bool,
+    },
     /// Check NetworkManager connectivity state.
     Connectivity {
         /// Emit JSON instead of plain state text.

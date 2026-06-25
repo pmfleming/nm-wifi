@@ -28,6 +28,8 @@ nm-wifi connect-target <target-json> [--password <secret>] [--wep-key-type key|p
 nm-wifi saved [--json]
 nm-wifi profile delete <path>
 nm-wifi profile autoconnect <path> true|false
+nm-wifi status [--json]
+nm-wifi disconnect [--json]
 nm-wifi connectivity [--json]
 nm-wifi active
 ```
@@ -48,6 +50,8 @@ Rofi script-mode rendering and callback/action encoding have been removed from t
 - `nm-wifi networks --cached --json` includes saved-profile matches and capabilities.
 - `nm-wifi saved --json` lists saved Wi-Fi profiles.
 - `nm-wifi connect-target <target-json> --json` accepts enriched network JSON from frontends and returns a structured connection result.
+- `nm-wifi status --json` reports active Wi-Fi details for frontends.
+- `nm-wifi disconnect --json` deactivates the active Wi-Fi connection.
 - `nm-wifi connectivity --json` reports NetworkManager connectivity state.
 - `nm-wifi profile delete` and `profile autoconnect` manage profiles by D-Bus object path.
 - `nm-wifi connect` activates saved, open, hidden, WEP, and PSK networks where supported.
