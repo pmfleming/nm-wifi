@@ -4,6 +4,7 @@ mod cache;
 mod cli;
 mod connect;
 mod contract;
+mod diagnose;
 mod list;
 mod logging;
 mod model;

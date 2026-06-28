@@ -100,12 +100,20 @@ Completed current phase:
 9. Added `auth` descriptors and `can_connect_with_credentials`/`needs_credentials` capability fields so enterprise networks are represented as credential-form work instead of permanent unsupported auth.
 10. Added an initial D-Bus WPA-Enterprise/802.1X creation path through `connect-target` `enterprise` credentials, including common EAP fields and `--password-stdin` password transport.
 
+Completed parity expansion:
+
+1. Added `key_mgmt` target hints so hidden/ambiguous networks can explicitly request open, OWE, WPA-PSK, SAE, WEP, or enterprise settings instead of relying on hidden-network password guessing.
+2. Expanded 802.1X target coverage with additional CA/path, subject, OpenSSL cipher, PEAP/FAST phase1, and secret-flag fields.
+3. Added a saved-profile clone/add-and-activate path for password/credential-supplied visible networks, preserving compatible profile settings while replacing the relevant secret/security settings and avoiding mutation of the original profile.
+4. Added structured `profile` target metadata for advanced settings: autoconnect, priority, metered state, cloned MAC, DHCP hostname, IP method, static addresses, gateway, DNS servers, static routes, route metric, DNS-search, and ignore-auto-DNS.
+5. Improved unsupported-auth reporting with AP flag labels for clearer frontend/debug output.
+
 Next:
 
-1. Teach Shelllist to render enterprise credential prompts/forms from `auth.required_fields`/`auth.optional_fields` and submit `enterprise` target metadata.
-2. Expand 802.1X coverage against nmcli behavior: EAP-TLS certificate fields, FAST/PAC options, Suite-B details, CA handling, and secret flags.
+1. Teach Shelllist to render enterprise credential prompts/forms from `auth.required_fields`/`auth.optional_fields` and submit richer `enterprise` target metadata.
+2. Teach Shelllist/profile forms to emit `profile.ipv4/ipv6` static address/DNS/route metadata when users edit manual network settings.
 3. Improve saved-profile compatibility checks beyond `AvailableConnections` for cached/offline records where possible.
-4. Add tests around connection metadata serialization, enterprise settings shape, and grouped AP output shape.
+4. Add more integration tests around connection metadata serialization, enterprise settings shape, and grouped AP output shape.
 5. Re-run `cargo fmt`, `cargo clippy`, `cargo test`, and `rust-quality-lens` after each phase.
 
 ## Current transport CLI
@@ -114,7 +122,7 @@ Next:
 nm-wifi list [--cached] [--json] [--refresh-cache]
 nm-wifi networks [--cached] [--json] [--refresh-cache]
 nm-wifi scan [--stream] [--cache] [--strict] [--timeout <seconds>] [--retries <count>] [--ifname <iface>] [--ssid <ssid>...]
-nm-wifi connect <ssid> [--password <secret>|--password-stdin] [--bssid <bssid>] [--hidden] [--wep-key-type key|phrase] [--json]
+nm-wifi connect <ssid> [--password <secret>|--password-stdin] [--bssid <bssid>] [--hidden] [--key-mgmt <hint>] [--wep-key-type key|phrase] [--json]
 nm-wifi connect-target <target-json> [--password <secret>|--password-stdin] [--wep-key-type key|phrase] [--json]
 nm-wifi saved [--json]
 nm-wifi profile delete <path>
@@ -124,6 +132,7 @@ nm-wifi profile send-hostname <path> true|false
 nm-wifi status [--json]
 nm-wifi disconnect [--json]
 nm-wifi connectivity [--json]
+nm-wifi diagnose [--json]
 nm-wifi active
 ```
 
@@ -136,4 +145,5 @@ nm-wifi active
 - Password-supplied activation does not prefer stale saved secrets.
 - `nm-wifi scan --stream --cache` emits JSON Lines snapshots and updates cache files.
 - `nm-wifi status --json` reports active Wi-Fi details for frontends.
+- `nm-wifi diagnose --json` compares active-network/cache parity with nmcli for Shelllist regressions.
 - `cargo fmt -- --check`, `cargo clippy -- -D warnings`, `cargo test`, and `rust-quality-lens measure all --config rqlens.toml` pass.

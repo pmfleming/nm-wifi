@@ -3,29 +3,20 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::cli::ProfileCommand;
+use crate::cli::{ConnectOptions, ConnectTargetOptions, ProfileCommand, ScanOptions};
 use crate::connect;
 use crate::model::{
     ConnectResult, ScanRequestOptions, ScanStreamOptions, WepKeyType, WifiConnectTarget,
-    validate_ssid_bytes,
+    WifiStatus, validate_ssid_bytes,
 };
 use crate::nm::Nm;
 use crate::output::{
     print_access_points, print_connect_result, print_connectivity, print_disconnect_result,
-    print_saved_wifi_connections, print_saved_wifi_connections_json, print_wifi_status,
+    print_saved_wifi_connections, print_saved_wifi_connections_json, print_wifi_share_payload,
+    print_wifi_status,
 };
 
-pub(crate) struct ConnectSsidOptions {
-    pub(crate) ssid: String,
-    pub(crate) password: Option<String>,
-    pub(crate) password_stdin: bool,
-    pub(crate) bssid: Option<String>,
-    pub(crate) hidden: bool,
-    pub(crate) wep_key_type: Option<WepKeyType>,
-    pub(crate) json: bool,
-}
-
-pub(crate) fn connect_ssid(nm: &Nm, options: ConnectSsidOptions) -> Result<()> {
+pub(crate) fn connect_ssid(nm: &Nm, options: ConnectOptions) -> Result<()> {
     let target = WifiConnectTarget {
         ssid_bytes: options.ssid.as_bytes().to_vec(),
         ssid: options.ssid,
@@ -37,7 +28,9 @@ pub(crate) fn connect_ssid(nm: &Nm, options: ConnectSsidOptions) -> Result<()> {
         private: false,
         hidden: options.hidden,
         security: None,
+        key_mgmt: options.key_mgmt,
         enterprise: None,
+        profile: Default::default(),
     };
     let password = resolve_password(options.password, options.password_stdin)?;
     print_connect_attempt(
@@ -49,17 +42,16 @@ pub(crate) fn connect_ssid(nm: &Nm, options: ConnectSsidOptions) -> Result<()> {
     )
 }
 
-pub(crate) fn connect_target(
-    nm: &Nm,
-    target_json: String,
-    password: Option<String>,
-    password_stdin: bool,
-    wep_key_type: Option<WepKeyType>,
-    json: bool,
-) -> Result<()> {
-    let target = parse_connect_target(&target_json)?;
-    let password = resolve_password(password, password_stdin)?;
-    print_connect_attempt(nm, &target, password.as_deref(), wep_key_type, json)
+pub(crate) fn connect_target(nm: &Nm, options: ConnectTargetOptions) -> Result<()> {
+    let target = parse_connect_target(&options.target_json)?;
+    let password = resolve_password(options.password, options.password_stdin)?;
+    print_connect_attempt(
+        nm,
+        &target,
+        password.as_deref(),
+        options.wep_key_type,
+        options.json,
+    )
 }
 
 fn print_connect_attempt(
@@ -108,17 +100,7 @@ fn resolve_password(password: Option<String>, password_stdin: bool) -> Result<Op
     Ok(Some(value))
 }
 
-pub(crate) struct ScanCommandOptions {
-    pub(crate) timeout: u64,
-    pub(crate) stream: bool,
-    pub(crate) strict: bool,
-    pub(crate) retries: u32,
-    pub(crate) cache: bool,
-    pub(crate) ifname: Option<String>,
-    pub(crate) ssids: Vec<String>,
-}
-
-pub(crate) fn run_scan(nm: &Nm, options: ScanCommandOptions) -> Result<()> {
+pub(crate) fn run_scan(nm: &Nm, options: ScanOptions) -> Result<()> {
     tracing::info!(
         options.timeout,
         options.stream,
@@ -197,6 +179,11 @@ pub(crate) fn run_profile_command(nm: &Nm, command: ProfileCommand) -> Result<()
             tracing::info!(path, randomized, "setting saved Wi-Fi profile MAC privacy");
             nm.set_connection_mac_randomization_by_path(&path, randomized)?;
         }
+        ProfileCommand::Share { path, json } => {
+            tracing::info!(path, json, "building saved Wi-Fi profile share payload");
+            let payload = nm.wifi_share_payload_by_path(&path)?;
+            print_wifi_share_payload(&payload, json)?;
+        }
         ProfileCommand::SendHostname { path, enabled } => {
             tracing::info!(
                 path,
@@ -210,11 +197,15 @@ pub(crate) fn run_profile_command(nm: &Nm, command: ProfileCommand) -> Result<()
 }
 
 pub(crate) fn print_status(nm: &Nm, json: bool) -> Result<()> {
-    print_wifi_status(&nm.wifi_status()?, json)
+    let status = nm.wifi_status()?;
+    cache_status_best_effort(&status);
+    print_wifi_status(&status, json)
 }
 
 pub(crate) fn disconnect(nm: &Nm, json: bool) -> Result<()> {
-    print_disconnect_result(&nm.disconnect_wifi()?, json)
+    let result = nm.disconnect_wifi()?;
+    clear_active_cache_best_effort();
+    print_disconnect_result(&result, json)
 }
 
 pub(crate) fn print_connectivity_state(nm: &Nm, json: bool) -> Result<()> {
@@ -226,6 +217,18 @@ pub(crate) fn print_active_ssid(nm: &Nm) -> Result<()> {
         println!("{ssid}");
     }
     Ok(())
+}
+
+fn cache_status_best_effort(status: &WifiStatus) {
+    if let Err(err) = crate::cache::cache_connected_network_status(status) {
+        tracing::warn!(error = %format_args!("{err:#}"), "failed to cache active Wi-Fi status");
+    }
+}
+
+fn clear_active_cache_best_effort() {
+    if let Err(err) = crate::cache::clear_active_connection_cache() {
+        tracing::warn!(error = %format_args!("{err:#}"), "failed to clear active Wi-Fi cache");
+    }
 }
 
 fn parse_connect_target(target_json: &str) -> Result<WifiConnectTarget> {

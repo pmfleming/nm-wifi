@@ -7,7 +7,9 @@ use anyhow::{Context, Result};
 use zvariant::OwnedObjectPath;
 
 use crate::cache;
-use crate::model::{ConnectFailureReason, ConnectResult, WepKeyType, WifiConnectTarget};
+use crate::model::{
+    ConnectFailureReason, ConnectResult, WepKeyType, WifiConnectTarget, WifiStatus,
+};
 use crate::nm::Nm;
 
 const NMCLI_CONNECT_TIMEOUT_SECS: &str = "90";
@@ -78,7 +80,11 @@ pub(crate) fn connect_target_with_password(
             tracing::info!(ssid = %target.ssid, message = %message, "Wi-Fi connection succeeded");
             write_cache_status_best_effort("connected", &message);
             refresh_cached_networks_best_effort(nm);
-            let connectivity = nm.connectivity_check().ok();
+            let active_status = cache_active_status_best_effort(nm);
+            let connectivity = active_status
+                .as_ref()
+                .and_then(|status| status.connectivity.clone())
+                .or_else(|| nm.connectivity_check().ok());
             let suggest_open_portal = connectivity
                 .as_ref()
                 .is_some_and(|status| status.captive_portal);
@@ -108,61 +114,97 @@ fn activate_saved_or_visible(
     password: Option<&str>,
     wep_key_type: Option<WepKeyType>,
 ) -> Result<String> {
-    match nm.activate_saved_wifi_connection_for(target, password, wep_key_type) {
+    match nm.active_ssid_matches(target) {
         Ok(true) => {
-            tracing::info!(ssid = %target.ssid, "requested activation of saved Wi-Fi profile over D-Bus");
-            wait_for_active_target(nm, target)?;
-            Ok(format!(
-                "Connected to saved network {} via D-Bus",
-                target.ssid
-            ))
+            tracing::info!(ssid = %target.ssid, "target Wi-Fi network is already active; skipping reactivation");
+            return Ok(format!("Already connected to {}", target.ssid));
         }
-        Ok(false) => {
-            tracing::info!(ssid = %target.ssid, "no saved D-Bus profile activation target; trying add-and-activate path");
-            match nm.add_and_activate_wifi_connection_for(target, password, wep_key_type) {
-                Ok(Some(created_connection)) => {
-                    tracing::info!(ssid = %target.ssid, connection = %created_connection, "created and requested activation of Wi-Fi profile over D-Bus");
-                    wait_for_new_connection(nm, target, &created_connection)?;
-                    Ok(format!(
-                        "Connected to Wi-Fi network {} via D-Bus",
-                        target.ssid
-                    ))
-                }
-                Ok(None) => {
-                    tracing::info!(ssid = %target.ssid, "D-Bus add-and-activate not applicable; trying nmcli fallback");
-                    activate_with_nmcli_fallback(target, password, wep_key_type)
-                }
-                Err(dbus_err) => {
-                    tracing::warn!(ssid = %target.ssid, error = %format_args!("{dbus_err:#}"), "D-Bus add-and-activate failed; trying nmcli fallback");
-                    match activate_with_nmcli_fallback(target, password, wep_key_type) {
-                        Ok(message) => Ok(format!(
-                            "{message} (D-Bus add/activate failed: {dbus_err:#})"
-                        )),
-                        Err(fallback_err) => Err(combined_connect_failure(
-                            &dbus_err,
-                            &fallback_err,
-                            format!(
-                                "D-Bus add/activate failed: {dbus_err:#}; nmcli fallback failed: {fallback_err:#}"
-                            ),
-                        )),
-                    }
-                }
-            }
-        }
-        Err(dbus_err) => {
-            tracing::warn!(ssid = %target.ssid, error = %format_args!("{dbus_err:#}"), "D-Bus saved profile activation failed; trying nmcli fallback");
-            match activate_with_nmcli_fallback(target, password, wep_key_type) {
-                Ok(message) => Ok(format!("{message} (D-Bus activation failed: {dbus_err:#})")),
-                Err(fallback_err) => Err(combined_connect_failure(
-                    &dbus_err,
-                    &fallback_err,
-                    format!(
-                        "D-Bus saved profile activation failed: {dbus_err:#}; nmcli fallback failed: {fallback_err:#}"
-                    ),
-                )),
-            }
+        Ok(false) => {}
+        Err(err) => {
+            tracing::debug!(ssid = %target.ssid, error = %format_args!("{err:#}"), "could not check active Wi-Fi target before activation");
         }
     }
+
+    match nm.activate_saved_wifi_connection_for(target, password, wep_key_type) {
+        Ok(true) => activate_saved_profile(nm, target),
+        Ok(false) => add_activate_or_nmcli(nm, target, password, wep_key_type),
+        Err(dbus_err) => nmcli_after_dbus_failure(
+            target,
+            password,
+            wep_key_type,
+            &dbus_err,
+            "D-Bus activation failed",
+            "D-Bus saved profile activation failed",
+        ),
+    }
+}
+
+fn activate_saved_profile(nm: &Nm, target: &WifiConnectTarget) -> Result<String> {
+    tracing::info!(ssid = %target.ssid, "requested activation of saved Wi-Fi profile over D-Bus");
+    wait_for_active_target(nm, target)?;
+    Ok(format!(
+        "Connected to saved network {} via D-Bus",
+        target.ssid
+    ))
+}
+
+fn add_activate_or_nmcli(
+    nm: &Nm,
+    target: &WifiConnectTarget,
+    password: Option<&str>,
+    wep_key_type: Option<WepKeyType>,
+) -> Result<String> {
+    tracing::info!(ssid = %target.ssid, "no saved D-Bus profile activation target; trying add-and-activate path");
+    match nm.add_and_activate_wifi_connection_for(target, password, wep_key_type) {
+        Ok(Some(created_connection)) => {
+            activate_created_connection(nm, target, &created_connection)
+        }
+        Ok(None) => {
+            tracing::info!(ssid = %target.ssid, "D-Bus add-and-activate not applicable; trying nmcli fallback");
+            activate_with_nmcli_fallback(target, password, wep_key_type)
+        }
+        Err(dbus_err) => nmcli_after_dbus_failure(
+            target,
+            password,
+            wep_key_type,
+            &dbus_err,
+            "D-Bus add/activate failed",
+            "D-Bus add/activate failed",
+        ),
+    }
+}
+
+fn activate_created_connection(
+    nm: &Nm,
+    target: &WifiConnectTarget,
+    created_connection: &OwnedObjectPath,
+) -> Result<String> {
+    tracing::info!(ssid = %target.ssid, connection = %created_connection, "created and requested activation of Wi-Fi profile over D-Bus");
+    wait_for_new_connection(nm, target, created_connection)?;
+    Ok(format!(
+        "Connected to Wi-Fi network {} via D-Bus",
+        target.ssid
+    ))
+}
+
+fn nmcli_after_dbus_failure(
+    target: &WifiConnectTarget,
+    password: Option<&str>,
+    wep_key_type: Option<WepKeyType>,
+    dbus_err: &anyhow::Error,
+    success_note: &str,
+    failure_subject: &str,
+) -> Result<String> {
+    tracing::warn!(ssid = %target.ssid, error = %format_args!("{dbus_err:#}"), failure = failure_subject, "D-Bus activation path failed; trying nmcli fallback");
+    activate_with_nmcli_fallback(target, password, wep_key_type)
+        .map(|message| format!("{message} ({success_note}: {dbus_err:#})"))
+        .map_err(|fallback_err| {
+            combined_connect_failure(
+                dbus_err,
+                &fallback_err,
+                format!("{failure_subject}: {dbus_err:#}; nmcli fallback failed: {fallback_err:#}"),
+            )
+        })
 }
 
 fn wait_for_new_connection(
@@ -188,69 +230,90 @@ fn activate_with_nmcli_fallback(
     password: Option<&str>,
     wep_key_type: Option<WepKeyType>,
 ) -> Result<String> {
-    let ssid = target.ssid.as_str();
-    let saved_activation = if target.has_specific_ap() {
-        tracing::info!(ssid = %target.ssid, ap_path = ?target.ap_path, bssid = ?target.bssid, "skipping generic nmcli saved-profile activation for specific AP target");
-        Err(anyhow::anyhow!(
-            "skipped generic saved-profile activation for specific AP target"
-        ))
-    } else if password.is_some() {
-        tracing::info!(ssid = %target.ssid, "skipping nmcli saved-profile activation because caller supplied a password");
-        Err(anyhow::anyhow!(
-            "skipped saved-profile activation because caller supplied a password"
-        ))
-    } else {
-        tracing::info!(ssid = %target.ssid, "trying nmcli saved-profile activation fallback");
-        nmcli(&["connection", "up", "id", ssid])
-    };
-
-    match saved_activation {
-        Ok(_) => Ok(format!(
-            "Connected to saved network {ssid} via nmcli fallback"
+    match try_nmcli_saved_activation(target, password) {
+        Ok(()) => Ok(format!(
+            "Connected to saved network {} via nmcli fallback",
+            target.ssid
         )),
-        Err(saved_err) => {
-            if target.has_specific_ap() && target.bssid.as_deref().is_none_or(str::is_empty) {
-                tracing::warn!(ssid = %target.ssid, ap_path = ?target.ap_path, "not running generic nmcli Wi-Fi connect because selected AP cannot be represented without BSSID");
-                return Err(connect_failure(
-                    ConnectFailureReason::UnsupportedAuth,
-                    format!(
-                        "saved profile activation failed: {saved_err:#}; nmcli fallback cannot preserve selected AP path without a BSSID"
-                    ),
-                ));
-            }
-            let mut args = vec!["device", "wifi", "connect", ssid];
-            if let Some(password) = password {
-                args.extend(["password", password]);
-            }
-            if let Some(wep_key_type) = wep_key_type {
-                args.extend(["wep-key-type", wep_key_type.nmcli_value()]);
-            }
-            if let Some(bssid) = target.bssid.as_deref() {
-                args.extend(["bssid", bssid]);
-            }
-            if let Some(ifname) = target.ifname.as_deref() {
-                args.extend(["ifname", ifname]);
-            }
-            if target.hidden {
-                args.extend(["hidden", "yes"]);
-            }
-            if let Some(name) = target.connection_name.as_deref() {
-                args.extend(["name", name]);
-            }
-            if target.private {
-                args.extend(["private", "yes"]);
-            }
-            match nmcli(&args) {
-                Ok(_) => Ok(format!("Connected to {ssid} via nmcli fallback")),
-                Err(connect_err) => Err(connect_failure(
-                    fallback_failure_reason(target, password),
-                    format!(
-                        "saved profile activation failed: {saved_err:#}; wifi connect failed: {connect_err:#}"
-                    ),
-                )),
-            }
-        }
+        Err(saved_err) => nmcli_wifi_connect(target, password, wep_key_type, &saved_err),
     }
+}
+
+fn try_nmcli_saved_activation(target: &WifiConnectTarget, password: Option<&str>) -> Result<()> {
+    if target.has_specific_ap() {
+        tracing::info!(ssid = %target.ssid, ap_path = ?target.ap_path, bssid = ?target.bssid, "skipping generic nmcli saved-profile activation for specific AP target");
+        anyhow::bail!("skipped generic saved-profile activation for specific AP target");
+    }
+    if password.is_some() {
+        tracing::info!(ssid = %target.ssid, "skipping nmcli saved-profile activation because caller supplied a password");
+        anyhow::bail!("skipped saved-profile activation because caller supplied a password");
+    }
+
+    tracing::info!(ssid = %target.ssid, "trying nmcli saved-profile activation fallback");
+    nmcli(&["connection", "up", "id", target.ssid.as_str()]).map(|_| ())
+}
+
+fn nmcli_wifi_connect(
+    target: &WifiConnectTarget,
+    password: Option<&str>,
+    wep_key_type: Option<WepKeyType>,
+    saved_err: &anyhow::Error,
+) -> Result<String> {
+    if selected_ap_requires_unrepresentable_bssid(target) {
+        tracing::warn!(ssid = %target.ssid, ap_path = ?target.ap_path, "not running generic nmcli Wi-Fi connect because selected AP cannot be represented without BSSID");
+        return Err(connect_failure(
+            ConnectFailureReason::UnsupportedAuth,
+            format!(
+                "saved profile activation failed: {saved_err:#}; nmcli fallback cannot preserve selected AP path without a BSSID"
+            ),
+        ));
+    }
+
+    let args = nmcli_wifi_connect_args(target, password, wep_key_type);
+    nmcli(&args)
+        .map(|_| format!("Connected to {} via nmcli fallback", target.ssid))
+        .map_err(|connect_err| {
+            connect_failure(
+                fallback_failure_reason(target, password),
+                format!(
+                    "saved profile activation failed: {saved_err:#}; wifi connect failed: {connect_err:#}"
+                ),
+            )
+        })
+}
+
+fn selected_ap_requires_unrepresentable_bssid(target: &WifiConnectTarget) -> bool {
+    target.has_specific_ap() && target.bssid.as_deref().is_none_or(str::is_empty)
+}
+
+fn nmcli_wifi_connect_args<'a>(
+    target: &'a WifiConnectTarget,
+    password: Option<&'a str>,
+    wep_key_type: Option<WepKeyType>,
+) -> Vec<&'a str> {
+    let mut args = vec!["device", "wifi", "connect", target.ssid.as_str()];
+    if let Some(password) = password {
+        args.extend(["password", password]);
+    }
+    if let Some(wep_key_type) = wep_key_type {
+        args.extend(["wep-key-type", wep_key_type.nmcli_value()]);
+    }
+    if let Some(bssid) = target.bssid.as_deref() {
+        args.extend(["bssid", bssid]);
+    }
+    if let Some(ifname) = target.ifname.as_deref() {
+        args.extend(["ifname", ifname]);
+    }
+    if target.hidden {
+        args.extend(["hidden", "yes"]);
+    }
+    if let Some(name) = target.connection_name.as_deref() {
+        args.extend(["name", name]);
+    }
+    if target.private {
+        args.extend(["private", "yes"]);
+    }
+    args
 }
 
 fn combined_connect_failure(
@@ -457,6 +520,40 @@ fn write_cache_status_best_effort(state: impl Into<String>, message: impl Into<S
     }
 }
 
+fn cache_active_status_best_effort(nm: &Nm) -> Option<WifiStatus> {
+    match read_active_status_after_connect(nm) {
+        Ok(status) => {
+            if let Err(err) = cache::cache_connected_network_status(&status) {
+                tracing::warn!(error = %format_args!("{err:#}"), "failed to cache active Wi-Fi details after connect");
+            }
+            Some(status)
+        }
+        Err(err) => {
+            tracing::warn!(error = %format_args!("{err:#}"), "failed to read active Wi-Fi details after connect");
+            None
+        }
+    }
+}
+
+fn read_active_status_after_connect(nm: &Nm) -> Result<WifiStatus> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = nm.wifi_status()?;
+        if status_has_network_details(&status) || Instant::now() >= deadline {
+            return Ok(status);
+        }
+        sleep(ACTIVATION_POLL_INTERVAL);
+    }
+}
+
+fn status_has_network_details(status: &WifiStatus) -> bool {
+    status.ip4.as_ref().is_some_and(|ip4| {
+        ip4.address
+            .as_deref()
+            .is_some_and(|address| !address.is_empty())
+    })
+}
+
 fn refresh_cached_networks_best_effort(nm: &Nm) {
     if let Err(err) = refresh_cached_networks(nm) {
         tracing::warn!(error = %format_args!("{err:#}"), "failed to refresh Wi-Fi cache after connect");
@@ -474,7 +571,7 @@ mod tests {
     use super::{
         ConnectFailureReason, connect_failure, connect_failure_reason, fallback_failure_reason,
     };
-    use crate::model::WifiConnectTarget;
+    use crate::model::example_connect_target;
 
     #[test]
     fn typed_connect_errors_provide_machine_readable_reasons() {
@@ -488,7 +585,7 @@ mod tests {
 
     #[test]
     fn fallback_reason_uses_target_metadata_not_error_text() {
-        let mut target = test_target();
+        let mut target = example_connect_target(false);
         target.security = Some("WPA2/3".to_string());
         assert_eq!(
             fallback_failure_reason(&target, None),
@@ -500,21 +597,5 @@ mod tests {
             fallback_failure_reason(&target, Some("secret")),
             ConnectFailureReason::UnsupportedAuth
         );
-    }
-
-    fn test_target() -> WifiConnectTarget {
-        WifiConnectTarget {
-            ssid: "Example".to_string(),
-            ssid_bytes: b"Example".to_vec(),
-            ap_path: None,
-            bssid: None,
-            ifname: None,
-            device_path: None,
-            connection_name: None,
-            private: false,
-            hidden: false,
-            security: None,
-            enterprise: None,
-        }
     }
 }

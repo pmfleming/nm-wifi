@@ -17,7 +17,8 @@ pub(crate) fn emit_snapshot(nm: &Nm, scanning: bool, cache: bool) -> Result<usiz
     if cache {
         crate::cache::write_live_scan_snapshot(scanning, &access_points)?;
     }
-    let networks = nm.network_entries_for_access_points(access_points)?;
+    let mut networks = nm.network_entries_for_access_points(access_points)?;
+    crate::cache::attach_connection_details(&mut networks);
     emit_stream_event(&StreamOutput::Snapshot {
         scanning,
         networks_found,

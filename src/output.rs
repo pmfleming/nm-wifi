@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::model::{
     AccessPoint, ConnectResult, ConnectivityStatus, DisconnectResult, NetworkEntry,
-    SavedWifiConnection, WifiStatus,
+    SavedWifiConnection, WifiSharePayload, WifiStatus,
 };
 
 #[derive(Serialize)]
@@ -66,6 +66,22 @@ pub(crate) fn print_wifi_status(status: &WifiStatus, json: bool) -> Result<()> {
             println!("{}", access_point.ssid);
         }
         Ok(())
+    }
+}
+
+pub(crate) fn print_wifi_share_payload(payload: &WifiSharePayload, json: bool) -> Result<()> {
+    if json {
+        return print_pretty_json(payload, "serialize Wi-Fi share JSON");
+    }
+
+    if let Some(qr_payload) = &payload.qr_payload {
+        println!("{qr_payload}");
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Wi-Fi profile is not shareable: {}",
+            payload.reason.as_deref().unwrap_or("unknown reason")
+        );
     }
 }
 

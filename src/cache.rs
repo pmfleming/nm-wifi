@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -7,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::model::AccessPoint;
+use crate::model::{AccessPoint, ConnectionDetails, NetworkEntry, WifiStatus};
 
 const CACHE_VERSION: u32 = 1;
 const CACHE_DIR_NAME: &str = "nm-wifi";
@@ -37,6 +38,21 @@ struct CachedStatus {
     message: String,
     timed_out: Option<bool>,
     networks_found: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct CachedActiveStatus<'a> {
+    version: u32,
+    updated_at_ms: u128,
+    active: bool,
+    status: &'a WifiStatus,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct CachedKnownConnections {
+    version: u32,
+    updated_at_ms: u128,
+    connections: BTreeMap<String, ConnectionDetails>,
 }
 
 pub(crate) fn write_live_scan_snapshot(scanning: bool, networks: &[AccessPoint]) -> Result<()> {
@@ -91,6 +107,46 @@ pub(crate) fn read_snapshot() -> Result<Option<CachedSnapshot>> {
     Ok(Some(snapshot))
 }
 
+pub(crate) fn write_active_status(status: &WifiStatus) -> Result<()> {
+    write_json(
+        active_status_path(),
+        &CachedActiveStatus {
+            version: CACHE_VERSION,
+            updated_at_ms: now_ms(),
+            active: status.active,
+            status,
+        },
+    )
+}
+
+pub(crate) fn cache_connected_network_status(status: &WifiStatus) -> Result<()> {
+    write_active_status(status)?;
+    match &status.access_point {
+        Some(access_point) if status.active => {
+            remember_connection_details(access_point, status)?;
+            upsert_snapshot_access_point(access_point)
+        }
+        _ => mark_snapshot_inactive(),
+    }
+}
+
+pub(crate) fn attach_connection_details(networks: &mut [NetworkEntry]) {
+    let Ok(Some(known)) = read_known_connections() else {
+        return;
+    };
+    for network in networks {
+        network.last_connection = known
+            .connections
+            .get(&network_key(&network.access_point))
+            .cloned();
+    }
+}
+
+pub(crate) fn clear_active_connection_cache() -> Result<()> {
+    remove_file_if_exists(active_status_path())?;
+    mark_snapshot_inactive()
+}
+
 fn write_session_snapshot(scanning: bool, networks: &[AccessPoint]) -> Result<()> {
     write_snapshot_to(session_path(), scanning, networks)
 }
@@ -107,6 +163,105 @@ fn snapshot_record(scanning: bool, networks: &[AccessPoint]) -> CachedSnapshot {
         networks_found: networks.len(),
         networks: networks.to_vec(),
     }
+}
+
+fn remember_connection_details(access_point: &AccessPoint, status: &WifiStatus) -> Result<()> {
+    let mut known = read_known_connections()?.unwrap_or_else(empty_known_connections);
+    known.updated_at_ms = now_ms();
+    known.connections.insert(
+        network_key(access_point),
+        ConnectionDetails {
+            ip4: status.ip4.clone(),
+            wireless: status.wireless.clone(),
+            metered: status.metered.clone(),
+            active_since_ms: status.active_since_ms,
+            updated_at_ms: known.updated_at_ms,
+        },
+    );
+    write_known_connections(&known)
+}
+
+fn read_known_connections() -> Result<Option<CachedKnownConnections>> {
+    let Some(known) = read_json::<CachedKnownConnections>(known_connections_path())? else {
+        return Ok(None);
+    };
+    if known.version != CACHE_VERSION {
+        warn_cache_ignored(format!(
+            "known connections cache version {} is stale; expected {CACHE_VERSION}",
+            known.version
+        ));
+        return Ok(None);
+    }
+    Ok(Some(known))
+}
+
+fn empty_known_connections() -> CachedKnownConnections {
+    CachedKnownConnections {
+        version: CACHE_VERSION,
+        updated_at_ms: now_ms(),
+        connections: BTreeMap::new(),
+    }
+}
+
+fn write_known_connections(known: &CachedKnownConnections) -> Result<()> {
+    write_json(known_connections_path(), known)
+}
+
+fn network_key(access_point: &AccessPoint) -> String {
+    format!(
+        "{}|{}",
+        bytes_hex(access_point.ssid_bytes().as_ref()),
+        access_point.security
+    )
+}
+
+fn bytes_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn upsert_snapshot_access_point(access_point: &AccessPoint) -> Result<()> {
+    let mut networks = read_snapshot()?
+        .map(CachedSnapshot::into_networks)
+        .unwrap_or_default();
+    upsert_connected_access_point(&mut networks, access_point.clone());
+    write_snapshot(false, &networks)
+}
+
+fn upsert_connected_access_point(networks: &mut Vec<AccessPoint>, mut access_point: AccessPoint) {
+    networks
+        .iter_mut()
+        .for_each(|network| network.active = false);
+    access_point.active = true;
+
+    if let Some(existing) = networks
+        .iter_mut()
+        .find(|network| same_access_point(network, &access_point))
+    {
+        *existing = access_point;
+    } else {
+        networks.insert(0, access_point);
+    }
+}
+
+fn same_access_point(left: &AccessPoint, right: &AccessPoint) -> bool {
+    if !left.path.is_empty() && !right.path.is_empty() {
+        return left.path == right.path;
+    }
+    if !left.bssid.is_empty() && !right.bssid.is_empty() {
+        return left.bssid.eq_ignore_ascii_case(&right.bssid);
+    }
+    left.ssid_bytes().as_ref() == right.ssid_bytes().as_ref() && left.security == right.security
+}
+
+fn mark_snapshot_inactive() -> Result<()> {
+    let Some(snapshot) = read_snapshot()? else {
+        return Ok(());
+    };
+    let mut networks = snapshot.into_networks();
+    networks
+        .iter_mut()
+        .for_each(|network| network.active = false);
+    write_snapshot(false, &networks)
 }
 
 fn write_status_record(status: CachedStatus) -> Result<()> {
@@ -252,6 +407,14 @@ unsafe extern "C" {
     fn geteuid() -> u32;
 }
 
+fn remove_file_if_exists(path: PathBuf) -> Result<()> {
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
 fn warn_cache_ignored(message: String) {
     tracing::warn!(message = %message, "ignoring Wi-Fi cache");
     eprintln!("warning: ignoring Wi-Fi cache: {message}");
@@ -263,6 +426,14 @@ fn snapshot_path() -> PathBuf {
 
 fn status_path() -> PathBuf {
     cache_dir().join("status.json")
+}
+
+fn active_status_path() -> PathBuf {
+    cache_dir().join("active-status.json")
+}
+
+fn known_connections_path() -> PathBuf {
+    cache_dir().join("known-connections.json")
 }
 
 fn session_path() -> PathBuf {
@@ -302,7 +473,8 @@ pub(crate) fn now_ms() -> u128 {
 mod tests {
     use std::path::PathBuf;
 
-    use super::temp_path_for;
+    use super::{same_access_point, temp_path_for, upsert_connected_access_point};
+    use crate::model::AccessPoint;
 
     #[test]
     fn temp_paths_are_unique_for_same_cache_path() {
@@ -314,5 +486,52 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(first.parent(), path.parent());
         assert_eq!(second.parent(), path.parent());
+    }
+
+    #[test]
+    fn connected_access_point_replaces_cached_network_and_marks_only_it_active() {
+        let mut networks = vec![test_ap("/ap/1", "00:11:22:33:44:55", false)];
+        let connected = test_ap("/ap/1", "00:11:22:33:44:55", false);
+
+        upsert_connected_access_point(&mut networks, connected);
+
+        assert_eq!(networks.len(), 1);
+        assert!(networks[0].active);
+    }
+
+    #[test]
+    fn connected_access_point_can_be_matched_by_bssid_without_path() {
+        let left = test_ap("", "00:11:22:33:44:55", false);
+        let right = test_ap("", "00:11:22:33:44:55", true);
+
+        assert!(same_access_point(&left, &right));
+    }
+
+    fn test_ap(path: &str, bssid: &str, active: bool) -> AccessPoint {
+        AccessPoint {
+            ssid: "Example".to_string(),
+            ssid_bytes: b"Example".to_vec(),
+            active,
+            security: "WPA2/3".to_string(),
+            strength: 80,
+            frequency: 2412,
+            channel: 1,
+            band: "2.4 GHz".to_string(),
+            mode: "Infra".to_string(),
+            max_bitrate_mbps: 0,
+            bandwidth_mhz: 0,
+            ssid_hex: "4578616d706c65".to_string(),
+            wpa_flags_label: "(none)".to_string(),
+            rsn_flags_label: "(none)".to_string(),
+            bssid: bssid.to_string(),
+            last_seen: 0,
+            last_seen_age_ms: None,
+            path: path.to_string(),
+            device_path: "/device/1".to_string(),
+            device_iface: "wlan0".to_string(),
+            flags: 0,
+            wpa_flags: 0,
+            rsn_flags: 0,
+        }
     }
 }

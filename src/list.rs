@@ -70,7 +70,8 @@ pub(crate) fn print_enriched_network_list(
         log_file,
         true,
     )?;
-    let networks = nm.network_entries_for_access_points(access_points)?;
+    let mut networks = nm.network_entries_for_access_points(access_points)?;
+    cache::attach_connection_details(&mut networks);
     if json {
         print_network_entries_json(&networks)
     } else {

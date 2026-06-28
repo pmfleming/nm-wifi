@@ -2,15 +2,17 @@ use anyhow::{Context, Result};
 use zvariant::OwnedObjectPath;
 
 use super::wifi_settings::{
-    enterprise_wifi_connection_settings, hidden_wifi_connection_settings, psk_key_mgmt,
-    psk_wifi_connection_settings, wep_wifi_connection_settings,
+    apply_target_profile_settings, cloned_wifi_connection_settings,
+    enterprise_wifi_connection_settings, hidden_wifi_connection_settings,
+    owe_wifi_connection_settings, psk_key_mgmt, psk_wifi_connection_settings,
+    wep_wifi_connection_settings,
 };
 use super::{
     ACTIVE_CONNECTION_IFACE, ConnectionSettings, DEVICE_IFACE, NM_IFACE, NM_PATH, Nm, owned_value,
 };
 use crate::model::{
     WepKeyType, WifiConnectTarget, ap_is_passwordless, ap_supports_enterprise, ap_supports_psk,
-    ap_uses_wep,
+    ap_uses_owe, ap_uses_wep,
 };
 
 impl Nm {
@@ -72,9 +74,32 @@ impl Nm {
             rsn_flags = ap.rsn_flags,
             "preparing D-Bus add-and-activate for visible Wi-Fi network"
         );
+        if (password.is_some() || target.enterprise.is_some())
+            && let Some(saved_settings) =
+                self.saved_wifi_connection_settings_for_ap_on_device(&ap, &device)?
+        {
+            tracing::info!(ssid = %target.ssid, "cloning compatible saved profile settings for password/credential-supplied activation");
+            let mut settings = cloned_wifi_connection_settings(
+                saved_settings,
+                target,
+                &ap,
+                password,
+                wep_key_type,
+            )?;
+            apply_target_connection_metadata(&mut settings, target)?;
+            return self
+                .add_and_activate(&target.ssid, settings, device.path, ap_path)
+                .map(Some);
+        }
+
         let mut settings = if ap_is_passwordless(ap.flags, ap.wpa_flags, ap.rsn_flags) {
-            tracing::debug!(ssid = %target.ssid, "network is passwordless");
-            ConnectionSettings::new()
+            if ap_uses_owe(ap.wpa_flags, ap.rsn_flags) {
+                tracing::debug!(ssid = %target.ssid, "network uses OWE passwordless encryption");
+                owe_wifi_connection_settings()?
+            } else {
+                tracing::debug!(ssid = %target.ssid, "network is open/passwordless");
+                ConnectionSettings::new()
+            }
         } else if ap_supports_psk(ap.wpa_flags, ap.rsn_flags) {
             let Some(password) = password else {
                 tracing::info!(ssid = %target.ssid, "WPA/SAE network needs a password; no password supplied to D-Bus add-and-activate");
@@ -102,6 +127,7 @@ impl Nm {
         };
 
         apply_target_connection_metadata(&mut settings, target)?;
+        apply_target_profile_settings(&mut settings, target)?;
         self.add_and_activate(&target.ssid, settings, device.path, ap_path)
             .map(Some)
     }

@@ -40,6 +40,33 @@ where
     OwnedValue::try_from(Value::new(value)).context("create D-Bus variant value")
 }
 
+pub(crate) fn split_nmcli_fields(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+
+    for ch in line.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == ':' {
+            fields.push(std::mem::take(&mut current));
+        } else {
+            current.push(ch);
+        }
+    }
+
+    fields.push(current);
+    fields
+}
+
+pub(crate) fn split_nmcli_key_value(line: &str) -> Option<(String, String)> {
+    let mut parts = split_nmcli_fields(line).into_iter();
+    Some((parts.next()?, parts.next().unwrap_or_default()))
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct WifiActivationStatus {
     pub(crate) iface: String,
@@ -87,5 +114,18 @@ impl Nm {
         iface: &'a str,
     ) -> Result<Proxy<'a>> {
         self.proxy(path.as_str(), iface)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_nmcli_fields;
+
+    #[test]
+    fn split_nmcli_fields_unescapes_colons() {
+        assert_eq!(
+            split_nmcli_fields("a:b\\:c:d"),
+            vec!["a".to_string(), "b:c".to_string(), "d".to_string()]
+        );
     }
 }

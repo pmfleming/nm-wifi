@@ -51,6 +51,7 @@ fn shelllist_contract_fixture() -> ShelllistContractFixture {
             optional_fields: Vec::new(),
             note: Some("A compatible saved NetworkManager profile can be activated without collecting new credentials".to_string()),
         },
+        last_connection: None,
     };
     ShelllistContractFixture {
         network: network.clone(),

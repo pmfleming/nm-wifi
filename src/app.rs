@@ -17,101 +17,37 @@ pub fn run() -> Result<()> {
     tracing::debug!(path = %log_path.display(), "using log file");
 
     match command {
-        Command::List {
-            json,
-            cached,
-            refresh_cache,
-            refresh_timeout,
-        } => print_network_list(
-            json,
-            cached,
-            refresh_cache,
-            refresh_timeout,
+        Command::List(options) => print_network_list(
+            options.json,
+            options.cached,
+            options.refresh_cache,
+            options.refresh_timeout,
             verbose,
             &log_file,
         )?,
-        Command::Networks {
-            json,
-            cached,
-            refresh_cache,
-            refresh_timeout,
-        } => with_nm(|nm| {
+        Command::Networks(options) => with_nm(|nm| {
             print_enriched_network_list(
                 nm,
-                json,
-                cached,
-                refresh_cache,
-                refresh_timeout,
+                options.json,
+                options.cached,
+                options.refresh_cache,
+                options.refresh_timeout,
                 verbose,
                 &log_file,
             )
         })?,
-        Command::Scan {
-            timeout,
-            stream,
-            strict,
-            retries,
-            cache,
-            ifname,
-            ssids,
-        } => with_nm(|nm| {
-            actions::run_scan(
-                nm,
-                actions::ScanCommandOptions {
-                    timeout,
-                    stream,
-                    strict,
-                    retries,
-                    cache,
-                    ifname,
-                    ssids,
-                },
-            )
-        })?,
-        Command::Connect {
-            ssid,
-            password,
-            password_stdin,
-            bssid,
-            hidden,
-            wep_key_type,
-            json,
-        } => with_nm(|nm| {
-            actions::connect_ssid(
-                nm,
-                actions::ConnectSsidOptions {
-                    ssid,
-                    password,
-                    password_stdin,
-                    bssid,
-                    hidden,
-                    wep_key_type,
-                    json,
-                },
-            )
-        })?,
-        Command::ConnectTarget {
-            target_json,
-            password,
-            password_stdin,
-            wep_key_type,
-            json,
-        } => with_nm(|nm| {
-            actions::connect_target(
-                nm,
-                target_json,
-                password,
-                password_stdin,
-                wep_key_type,
-                json,
-            )
-        })?,
-        Command::Saved { json } => with_nm(|nm| actions::print_saved_profiles(nm, json))?,
+        Command::Scan(options) => with_nm(|nm| actions::run_scan(nm, options))?,
+        Command::Connect(options) => with_nm(|nm| actions::connect_ssid(nm, options))?,
+        Command::ConnectTarget(options) => with_nm(|nm| actions::connect_target(nm, options))?,
+        Command::Saved(options) => with_nm(|nm| actions::print_saved_profiles(nm, options.json))?,
         Command::Profile { command } => with_nm(|nm| actions::run_profile_command(nm, command))?,
-        Command::Status { json } => with_nm(|nm| actions::print_status(nm, json))?,
-        Command::Disconnect { json } => with_nm(|nm| actions::disconnect(nm, json))?,
-        Command::Connectivity { json } => {
-            with_nm(|nm| actions::print_connectivity_state(nm, json))?
+        Command::Status(options) => with_nm(|nm| actions::print_status(nm, options.json))?,
+        Command::Disconnect(options) => with_nm(|nm| actions::disconnect(nm, options.json))?,
+        Command::Connectivity(options) => {
+            with_nm(|nm| actions::print_connectivity_state(nm, options.json))?
+        }
+        Command::Diagnose(options) => {
+            with_nm(|nm| crate::diagnose::print_diagnosis(nm, options.json))?
         }
         Command::Active => with_nm(actions::print_active_ssid)?,
         Command::ContractFixture => crate::contract::print_shelllist_contract_fixture()?,

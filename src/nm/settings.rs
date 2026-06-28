@@ -9,7 +9,7 @@ use super::{
 };
 use crate::model::{
     AccessPoint, NetworkEntry, ProfilePrivacy, SavedWifiConnection, WifiConnectTarget, WifiDevice,
-    display_ssid, network_entries_with_profile_matches,
+    WifiSharePayload, display_ssid, network_entries_with_profile_matches,
 };
 
 impl Nm {
@@ -59,11 +59,13 @@ impl Nm {
         path: &str,
         autoconnect: bool,
     ) -> Result<()> {
-        let path = OwnedObjectPath::try_from(path).context("parse connection path")?;
-        let mut settings = self.connection_settings(&path)?;
-        let connection = settings.entry("connection".to_string()).or_default();
-        connection.insert("autoconnect".to_string(), owned_value(autoconnect)?);
-        self.update_connection_settings(&path, settings, "autoconnect")
+        self.mutate_connection_settings(path, "autoconnect", |settings| {
+            settings
+                .entry("connection".to_string())
+                .or_default()
+                .insert("autoconnect".to_string(), owned_value(autoconnect)?);
+            Ok(())
+        })
     }
 
     pub(crate) fn set_connection_mac_randomization_by_path(
@@ -71,14 +73,16 @@ impl Nm {
         path: &str,
         randomized: bool,
     ) -> Result<()> {
-        let path = OwnedObjectPath::try_from(path).context("parse connection path")?;
-        let mut settings = self.connection_settings(&path)?;
-        let wireless = settings.entry("802-11-wireless".to_string()).or_default();
-        wireless.insert(
-            "cloned-mac-address".to_string(),
-            owned_value(if randomized { "stable" } else { "permanent" }.to_string())?,
-        );
-        self.update_connection_settings(&path, settings, "MAC randomization")
+        self.mutate_connection_settings(path, "MAC randomization", |settings| {
+            settings
+                .entry("802-11-wireless".to_string())
+                .or_default()
+                .insert(
+                    "cloned-mac-address".to_string(),
+                    owned_value(if randomized { "stable" } else { "permanent" }.to_string())?,
+                );
+            Ok(())
+        })
     }
 
     pub(crate) fn set_connection_send_hostname_by_path(
@@ -86,11 +90,22 @@ impl Nm {
         path: &str,
         enabled: bool,
     ) -> Result<()> {
+        self.mutate_connection_settings(path, "DHCP hostname privacy", |settings| {
+            set_dhcp_send_hostname(settings, "ipv4", enabled)?;
+            set_dhcp_send_hostname(settings, "ipv6", enabled)
+        })
+    }
+
+    fn mutate_connection_settings(
+        &self,
+        path: &str,
+        action: &str,
+        mutate: impl FnOnce(&mut ConnectionSettings) -> Result<()>,
+    ) -> Result<()> {
         let path = OwnedObjectPath::try_from(path).context("parse connection path")?;
         let mut settings = self.connection_settings(&path)?;
-        set_dhcp_send_hostname(&mut settings, "ipv4", enabled)?;
-        set_dhcp_send_hostname(&mut settings, "ipv6", enabled)?;
-        self.update_connection_settings(&path, settings, "DHCP hostname privacy")
+        mutate(&mut settings)?;
+        self.update_connection_settings(&path, settings, action)
     }
 
     fn update_connection_settings(
@@ -116,6 +131,25 @@ impl Nm {
         }
         connections.sort_by_key(|connection| connection.id.to_lowercase());
         Ok(connections)
+    }
+
+    pub(crate) fn wifi_share_payload_by_path(&self, path: &str) -> Result<WifiSharePayload> {
+        let path = OwnedObjectPath::try_from(path).context("parse connection path")?;
+        let settings = self.connection_settings(&path)?;
+        let Some(profile) = saved_wifi_connection_from_settings(&path, &settings) else {
+            bail!("connection is not a saved Wi-Fi profile: {path}");
+        };
+
+        let secrets = self
+            .connection_secrets(&path, "802-11-wireless-security")
+            .map_err(|err| format!("{err:#}"))
+            .ok();
+
+        Ok(wifi_share_payload_for_settings(
+            &profile,
+            &settings,
+            secrets.as_ref(),
+        ))
     }
 
     pub(crate) fn network_entries_for_access_points(
@@ -200,6 +234,17 @@ impl Nm {
         }
     }
 
+    pub(super) fn saved_wifi_connection_settings_for_ap_on_device(
+        &self,
+        ap: &AccessPoint,
+        device: &WifiDevice,
+    ) -> Result<Option<ConnectionSettings>> {
+        let Some(path) = self.saved_wifi_connection_for_ap_on_device(ap, device)? else {
+            return Ok(None);
+        };
+        self.connection_settings(&path).map(Some)
+    }
+
     fn saved_wifi_connection_for_ap_on_device(
         &self,
         ap: &AccessPoint,
@@ -223,8 +268,9 @@ impl Nm {
     }
 
     fn connection_matches_ssid(&self, path: &OwnedObjectPath, ssid_bytes: &[u8]) -> Result<bool> {
-        let settings = self.connection_settings(path)?;
-        Ok(settings_match_wifi_ssid(&settings, ssid_bytes))
+        self.connection_settings_match(path, |settings| {
+            settings_match_wifi_ssid(settings, ssid_bytes)
+        })
     }
 
     fn connection_matches_access_point(
@@ -232,8 +278,15 @@ impl Nm {
         path: &OwnedObjectPath,
         ap: &AccessPoint,
     ) -> Result<bool> {
-        let settings = self.connection_settings(path)?;
-        Ok(settings_match_access_point(&settings, ap))
+        self.connection_settings_match(path, |settings| settings_match_access_point(settings, ap))
+    }
+
+    fn connection_settings_match(
+        &self,
+        path: &OwnedObjectPath,
+        matches: impl FnOnce(&ConnectionSettings) -> bool,
+    ) -> Result<bool> {
+        Ok(matches(&self.connection_settings(path)?))
     }
 
     fn saved_connections(&self) -> Result<Vec<OwnedObjectPath>> {
@@ -248,6 +301,17 @@ impl Nm {
         connection
             .call("GetSettings", &())
             .with_context(|| format!("GetSettings for {path}"))
+    }
+
+    fn connection_secrets(
+        &self,
+        path: &OwnedObjectPath,
+        setting_name: &str,
+    ) -> Result<ConnectionSettings> {
+        let connection = self.proxy_path(path, SETTINGS_CONNECTION_IFACE)?;
+        connection
+            .call("GetSecrets", &(setting_name,))
+            .with_context(|| format!("GetSecrets {setting_name} for {path}"))
     }
 
     fn available_connections(&self, device: &WifiDevice) -> Result<Vec<OwnedObjectPath>> {
@@ -321,6 +385,157 @@ fn saved_wifi_connection_from_settings(
         autoconnect,
         privacy,
     })
+}
+
+fn wifi_share_payload_for_settings(
+    profile: &SavedWifiConnection,
+    settings: &ConnectionSettings,
+    secrets: Option<&ConnectionSettings>,
+) -> WifiSharePayload {
+    let hidden = settings
+        .get("802-11-wireless")
+        .and_then(|wireless| wireless.get("hidden"))
+        .and_then(setting_bool)
+        .unwrap_or(false);
+    let security = settings.get("802-11-wireless-security");
+    let key_mgmt = security
+        .and_then(|section| setting_string(section, "key-mgmt"))
+        .unwrap_or_default();
+
+    if security.is_none() || (key_mgmt.is_empty() && !has_wep_settings(settings, secrets)) {
+        return shareable_payload(profile, "nopass", None, hidden);
+    }
+
+    match key_mgmt.as_str() {
+        "wpa-psk" | "sae" => secret_payload(profile, "WPA", "psk", settings, secrets, hidden),
+        "none" | "" if has_wep_settings(settings, secrets) => {
+            let key_index = security
+                .and_then(|section| setting_u32(section.get("wep-tx-keyidx")?))
+                .unwrap_or(0)
+                .min(3);
+            let key = format!("wep-key{key_index}");
+            secret_payload(profile, "WEP", &key, settings, secrets, hidden)
+        }
+        "none" | "" => shareable_payload(profile, "nopass", None, hidden),
+        "owe" => unshareable_payload(
+            profile,
+            "OWE/enhanced-open QR sharing is not supported by the standard Wi-Fi QR format",
+        ),
+        value if value.contains("eap") => {
+            unshareable_payload(profile, "enterprise Wi-Fi QR sharing is not supported")
+        }
+        value => unshareable_payload(
+            profile,
+            &format!("unsupported Wi-Fi security type: {value}"),
+        ),
+    }
+}
+
+fn has_wep_settings(settings: &ConnectionSettings, secrets: Option<&ConnectionSettings>) -> bool {
+    (0..=3).any(|index| {
+        let key = format!("wep-key{index}");
+        secret_string(settings, secrets, &key).is_some()
+            || section_has_key(
+                settings,
+                "802-11-wireless-security",
+                &format!("{key}-flags"),
+            )
+    }) || section_has_key(settings, "802-11-wireless-security", "wep-tx-keyidx")
+        || section_has_key(settings, "802-11-wireless-security", "auth-alg")
+}
+
+fn secret_payload(
+    profile: &SavedWifiConnection,
+    auth_type: &str,
+    secret_key: &str,
+    settings: &ConnectionSettings,
+    secrets: Option<&ConnectionSettings>,
+    hidden: bool,
+) -> WifiSharePayload {
+    let Some(password) = secret_string(settings, secrets, secret_key) else {
+        return unshareable_payload(
+            profile,
+            &format!("saved {auth_type} password is not readable from NetworkManager"),
+        );
+    };
+    shareable_payload(profile, auth_type, Some(&password), hidden)
+}
+
+fn shareable_payload(
+    profile: &SavedWifiConnection,
+    auth_type: &str,
+    password: Option<&str>,
+    hidden: bool,
+) -> WifiSharePayload {
+    WifiSharePayload {
+        status: "ok",
+        shareable: true,
+        reason: None,
+        path: profile.path.clone(),
+        id: profile.id.clone(),
+        ssid: profile.ssid.clone(),
+        auth_type: Some(auth_type.to_string()),
+        qr_payload: Some(wifi_qr_payload(auth_type, &profile.ssid, password, hidden)),
+    }
+}
+
+fn unshareable_payload(profile: &SavedWifiConnection, reason: &str) -> WifiSharePayload {
+    WifiSharePayload {
+        status: "unavailable",
+        shareable: false,
+        reason: Some(reason.to_string()),
+        path: profile.path.clone(),
+        id: profile.id.clone(),
+        ssid: profile.ssid.clone(),
+        auth_type: None,
+        qr_payload: None,
+    }
+}
+
+fn secret_string(
+    settings: &ConnectionSettings,
+    secrets: Option<&ConnectionSettings>,
+    key: &str,
+) -> Option<String> {
+    secrets
+        .and_then(|secrets| secrets.get("802-11-wireless-security"))
+        .and_then(|section| setting_string(section, key))
+        .or_else(|| {
+            settings
+                .get("802-11-wireless-security")
+                .and_then(|section| setting_string(section, key))
+        })
+        .filter(|value| !value.is_empty())
+}
+
+fn section_has_key(settings: &ConnectionSettings, section: &str, key: &str) -> bool {
+    settings
+        .get(section)
+        .is_some_and(|settings| settings.contains_key(key))
+}
+
+fn wifi_qr_payload(auth_type: &str, ssid: &str, password: Option<&str>, hidden: bool) -> String {
+    let password = password
+        .map(|password| format!(";P:{}", wifi_qr_escape(password)))
+        .unwrap_or_default();
+    let hidden = if hidden { ";H:true" } else { "" };
+    format!(
+        "WIFI:T:{};S:{}{}{};;",
+        auth_type,
+        wifi_qr_escape(ssid),
+        password,
+        hidden
+    )
+}
+
+fn wifi_qr_escape(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|ch| match ch {
+            '\\' | ';' | ',' | ':' | '"' => vec!['\\', ch],
+            ch => vec![ch],
+        })
+        .collect()
 }
 
 fn privacy_from_settings(settings: &ConnectionSettings) -> ProfilePrivacy {
@@ -409,6 +624,10 @@ fn setting_bool(value: &OwnedValue) -> Option<bool> {
     value.try_clone().ok()?.try_into().ok()
 }
 
+fn setting_u32(value: &OwnedValue) -> Option<u32> {
+    value.try_clone().ok()?.try_into().ok()
+}
+
 fn setting_bytes(value: &OwnedValue) -> Option<Vec<u8>> {
     value.try_clone().ok()?.try_into().ok()
 }
@@ -435,116 +654,5 @@ fn root_object_path() -> Result<OwnedObjectPath> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ConnectionSettings, saved_wifi_profile_candidate_from_settings,
-        settings_match_access_point, settings_match_wifi_ssid, ssid_bytes_match,
-    };
-    use crate::model::AccessPoint;
-    use std::collections::HashMap;
-    use zvariant::{OwnedObjectPath, OwnedValue, Value};
-
-    #[test]
-    fn ssid_bytes_match_exact_bytes() {
-        assert!(ssid_bytes_match(b"Example", b"Example"));
-        assert!(ssid_bytes_match(&[0xff], &[0xff]));
-        assert!(!ssid_bytes_match(&[0xff], "�".as_bytes()));
-    }
-
-    #[test]
-    fn settings_match_wireless_ssid() {
-        let settings = wifi_settings("Example", "802-11-wireless");
-
-        assert!(settings_match_wifi_ssid(&settings, b"Example"));
-        assert!(!settings_match_wifi_ssid(&settings, b"Other"));
-    }
-
-    #[test]
-    fn settings_reject_non_wireless_profiles() {
-        let settings = wifi_settings("Example", "ethernet");
-
-        assert!(!settings_match_wifi_ssid(&settings, b"Example"));
-    }
-
-    #[test]
-    fn cached_profile_candidate_matches_access_point_without_refetching_settings() {
-        let mut settings = wifi_settings("Example", "802-11-wireless");
-        settings
-            .get_mut("802-11-wireless")
-            .expect("wireless settings")
-            .insert(
-                "bssid".to_string(),
-                owned_value(Value::new(vec![0x00_u8, 0x11, 0x22, 0x33, 0x44, 0x55])),
-            );
-        let path = OwnedObjectPath::try_from("/profile/1").expect("profile path");
-        let candidate = saved_wifi_profile_candidate_from_settings(&path, &settings)
-            .expect("profile candidate");
-
-        let matching_ap = test_ap("Example", "00:11:22:33:44:55");
-        assert!(candidate.matches_access_point(&matching_ap));
-        assert_eq!(
-            candidate.matches_access_point(&matching_ap),
-            settings_match_access_point(&settings, &matching_ap)
-        );
-
-        let wrong_bssid_ap = test_ap("Example", "66:77:88:99:aa:bb");
-        assert!(!candidate.matches_access_point(&wrong_bssid_ap));
-        assert_eq!(
-            candidate.matches_access_point(&wrong_bssid_ap),
-            settings_match_access_point(&settings, &wrong_bssid_ap)
-        );
-
-        let wrong_ssid_ap = test_ap("Other", "00:11:22:33:44:55");
-        assert!(!candidate.matches_access_point(&wrong_ssid_ap));
-    }
-
-    fn wifi_settings(ssid: &str, connection_type: &str) -> ConnectionSettings {
-        let mut settings = ConnectionSettings::new();
-        settings.insert(
-            "connection".to_string(),
-            HashMap::from([(
-                "type".to_string(),
-                owned_value(Value::new(connection_type.to_string())),
-            )]),
-        );
-        settings.insert(
-            "802-11-wireless".to_string(),
-            HashMap::from([(
-                "ssid".to_string(),
-                owned_value(Value::new(ssid.as_bytes().to_vec())),
-            )]),
-        );
-        settings
-    }
-
-    fn test_ap(ssid: &str, bssid: &str) -> AccessPoint {
-        AccessPoint {
-            ssid: ssid.to_string(),
-            ssid_bytes: ssid.as_bytes().to_vec(),
-            active: false,
-            security: "WPA2/3".to_string(),
-            strength: 50,
-            frequency: 2412,
-            channel: 1,
-            band: "2.4 GHz".to_string(),
-            mode: "Infra".to_string(),
-            max_bitrate_mbps: 0,
-            bandwidth_mhz: 0,
-            ssid_hex: String::new(),
-            wpa_flags_label: String::new(),
-            rsn_flags_label: String::new(),
-            bssid: bssid.to_string(),
-            last_seen: 0,
-            last_seen_age_ms: None,
-            path: "/ap/1".to_string(),
-            device_path: "/device/1".to_string(),
-            device_iface: "wlan0".to_string(),
-            flags: 0,
-            wpa_flags: 0,
-            rsn_flags: 0,
-        }
-    }
-
-    fn owned_value(value: Value<'_>) -> OwnedValue {
-        OwnedValue::try_from(value).expect("owned value")
-    }
+    include!("../../test_support/settings_unit.rs");
 }
