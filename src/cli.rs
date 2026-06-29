@@ -125,8 +125,8 @@ pub(crate) struct ConnectOptions {
 
 #[derive(Clone, Args)]
 pub(crate) struct ConnectTargetOptions {
-    /// JSON object with ssid, ssid_bytes, ap_path/path, bssid, and hidden fields.
-    pub(crate) target_json: String,
+    /// Deprecated compatibility JSON object with ssid, ssid_bytes, ap_path/path, bssid, and hidden fields. Omit to read a request JSON object from stdin.
+    pub(crate) target_json: Option<String>,
     /// Read the Wi-Fi password from the first line of stdin.
     #[arg(long)]
     pub(crate) password_stdin: bool,

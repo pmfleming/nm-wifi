@@ -66,7 +66,7 @@ Current transport remains command-oriented while the boundary hardens:
 nm-api networks [--cached] [--refresh-cache]
 nm-api scan [--stream] [--cache] [--strict] [--timeout <seconds>] [--retries <count>] [--ifname <iface>] [--ssid <ssid>...]
 nm-api connect <ssid> [--password-stdin] [--bssid <bssid>] [--hidden] [--key-mgmt <hint>] [--wep-key-type key|phrase]
-nm-api connect-target <target-json> [--password-stdin] [--wep-key-type key|phrase]
+nm-api connect-target [<target-json>] [--password-stdin] [--wep-key-type key|phrase]
 nm-api saved
 nm-api profile delete <path>
 nm-api profile autoconnect <path> true|false
@@ -80,6 +80,7 @@ nm-api connectivity
 
 Deprecated compatibility accepted for now:
 
+- Positional `connect-target <target-json>` is accepted while callers migrate to stdin request JSON.
 - `--json` is accepted as a no-op while callers migrate.
 - `list` still exists as a compatibility alias for access-point listing, but is not Shelllist's primary API.
 - `debug diagnose` and `debug contract-fixture` are unstable/debug surfaces.
@@ -150,12 +151,12 @@ Started:
 6. Updated Shelllist to invoke `nm-api` and unwrap v1 response envelopes.
 7. Updated the Shelllist contract check to validate the v1 envelope.
 8. Moved `diagnose` and `contract-fixture` under the explicit `debug` namespace.
+9. Added stdin request JSON for `connect-target` and updated Shelllist to send targets/secrets through that transport; positional target JSON remains temporarily compatible.
 
 Next:
 
-1. Replace positional JSON for `connect-target` with stdin JSON while keeping a short compatibility window.
-2. Add per-method v1 fixtures and schema checks.
-3. Convert scan JSONL events to include protocol/version or a stream-specific v1 envelope.
-4. Tighten all errors into the frontend error-code set.
-5. Remove deprecated `--json` no-op flags and the `list` compatibility alias.
-6. Re-run formatting, clippy, tests, Shelllist contract checks, and rust-quality-lens after each phase.
+1. Add per-method v1 fixtures and schema checks.
+2. Convert scan JSONL events to include protocol/version or a stream-specific v1 envelope.
+3. Tighten all errors into the frontend error-code set.
+4. Remove deprecated positional `connect-target <target-json>`, `--json` no-op flags, and the `list` compatibility alias.
+5. Re-run formatting, clippy, tests, Shelllist contract checks, and rust-quality-lens after each phase.

@@ -161,7 +161,8 @@ impl ConnectivityStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
 pub(crate) enum WepKeyType {
     Key,
     Phrase,

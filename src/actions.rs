@@ -1,7 +1,7 @@
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Read};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::cli::{ConnectOptions, ConnectTargetOptions, ProfileCommand, ScanOptions};
 use crate::connect;
@@ -15,6 +15,7 @@ use crate::output::{
     print_disconnect_result, print_saved_wifi_connections_json, print_wifi_share_payload,
     print_wifi_status,
 };
+use serde::Deserialize;
 
 pub(crate) fn connect_ssid(nm: &Nm, options: ConnectOptions) -> Result<()> {
     let target = WifiConnectTarget {
@@ -43,14 +44,13 @@ pub(crate) fn connect_ssid(nm: &Nm, options: ConnectOptions) -> Result<()> {
 }
 
 pub(crate) fn connect_target(nm: &Nm, options: ConnectTargetOptions) -> Result<()> {
-    let target = parse_connect_target(&options.target_json)?;
-    let password = resolve_password(options.password_stdin)?;
+    let request = connect_target_request(options)?;
     print_connect_attempt(
         nm,
-        &target,
-        password.as_deref(),
-        options.wep_key_type,
-        options.json,
+        &request.target,
+        request.password.as_deref(),
+        request.wep_key_type,
+        request.json,
     )
 }
 
@@ -218,6 +218,70 @@ fn cache_status_best_effort(status: &WifiStatus) {
 fn clear_active_cache_best_effort() {
     if let Err(err) = crate::cache::clear_active_connection_cache() {
         tracing::warn!(error = %format_args!("{err:#}"), "failed to clear active Wi-Fi cache");
+    }
+}
+
+#[derive(Deserialize)]
+struct ConnectTargetStdinRequest {
+    target: WifiConnectTarget,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    wep_key_type: Option<WepKeyType>,
+}
+
+struct ConnectTargetRequest {
+    target: WifiConnectTarget,
+    password: Option<String>,
+    wep_key_type: Option<WepKeyType>,
+    json: bool,
+}
+
+fn connect_target_request(options: ConnectTargetOptions) -> Result<ConnectTargetRequest> {
+    if let Some(target_json) = options.target_json {
+        let target = parse_connect_target(&target_json)?;
+        let password = resolve_password(options.password_stdin)?;
+        return Ok(ConnectTargetRequest {
+            target,
+            password,
+            wep_key_type: options.wep_key_type,
+            json: options.json,
+        });
+    }
+
+    if options.password_stdin {
+        bail!(
+            "connect-target without a positional target reads stdin as JSON; include password in the request object instead of --password-stdin"
+        );
+    }
+
+    let mut request_json = String::new();
+    io::stdin()
+        .read_to_string(&mut request_json)
+        .context("read Wi-Fi connect target request JSON from stdin")?;
+    let request_json = request_json.trim();
+    if request_json.is_empty() {
+        bail!("connect-target requires a target JSON argument or request JSON on stdin");
+    }
+
+    match serde_json::from_str::<ConnectTargetStdinRequest>(request_json) {
+        Ok(request) => Ok(ConnectTargetRequest {
+            target: request.target,
+            password: request.password,
+            wep_key_type: request.wep_key_type.or(options.wep_key_type),
+            json: options.json,
+        }),
+        Err(request_err) => match serde_json::from_str::<WifiConnectTarget>(request_json) {
+            Ok(target) => Ok(ConnectTargetRequest {
+                target,
+                password: None,
+                wep_key_type: options.wep_key_type,
+                json: options.json,
+            }),
+            Err(target_err) => Err(target_err).context(format!(
+                "parse Wi-Fi connect target request JSON: {request_err}"
+            )),
+        },
     }
 }
 
