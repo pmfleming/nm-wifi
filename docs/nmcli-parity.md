@@ -1,6 +1,6 @@
 # nmcli parity matrix
 
-`nm-api diagnose [--json]` is the local parity probe for the Shelllist-facing
+`nm-api debug diagnose [--json]` is the local parity probe for the Shelllist-facing
 subset of `nmcli` behavior. It compares `nm-api`'s D-Bus/cache view with live
 `nmcli` output and reports pass/warn/fail/unknown checks.
 
@@ -21,8 +21,8 @@ subset of `nmcli` behavior. It compares `nm-api`'s D-Bus/cache view with live
 ## Usage
 
 ```bash
-nm-api diagnose
-nm-api diagnose --json | jq '.summary, .checks'
+nm-api debug diagnose
+nm-api debug diagnose --json | jq '.summary, .checks'
 ```
 
 A clean Shelllist parity run should have no `fail` checks. `warn` usually means

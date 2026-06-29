@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use crate::actions;
-use crate::cli::{Cli, Command};
+use crate::cli::{Cli, Command, DebugCommand};
 use crate::list::{print_enriched_network_list, print_network_list};
 use crate::logging;
 use crate::nm::Nm;
@@ -46,10 +46,12 @@ pub fn run() -> Result<()> {
         Command::Connectivity(options) => {
             with_nm(|nm| actions::print_connectivity_state(nm, options.json))?
         }
-        Command::Diagnose(options) => {
-            with_nm(|nm| crate::diagnose::print_diagnosis(nm, options.json))?
-        }
-        Command::ContractFixture => crate::contract::print_shelllist_contract_fixture()?,
+        Command::Debug { command } => match command {
+            DebugCommand::Diagnose(options) => {
+                with_nm(|nm| crate::diagnose::print_diagnosis(nm, options.json))?
+            }
+            DebugCommand::ContractFixture => crate::contract::print_shelllist_contract_fixture()?,
+        },
     }
 
     Ok(())

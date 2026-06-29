@@ -49,7 +49,7 @@ Compatibility during migration:
 
 - `--json` is accepted as a no-op.
 - `list` exists as an access-point listing alias but is not the primary Shelllist API.
-- `diagnose` and `contract-fixture` are debug/unstable surfaces.
+- `debug diagnose` and `debug contract-fixture` are debug/unstable surfaces.
 
 Secrets must use `--password-stdin`; argv password transport has been removed.
 

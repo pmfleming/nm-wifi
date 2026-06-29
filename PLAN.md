@@ -82,7 +82,7 @@ Deprecated compatibility accepted for now:
 
 - `--json` is accepted as a no-op while callers migrate.
 - `list` still exists as a compatibility alias for access-point listing, but is not Shelllist's primary API.
-- `diagnose` and `contract-fixture` are unstable/debug surfaces.
+- `debug diagnose` and `debug contract-fixture` are unstable/debug surfaces.
 
 Removed from the supported frontend API:
 
@@ -149,13 +149,13 @@ Started:
 5. Made core API responses use the v1 envelope (`protocol`, `version`, `ok`, `data`, and typed `error` for connect failures).
 6. Updated Shelllist to invoke `nm-api` and unwrap v1 response envelopes.
 7. Updated the Shelllist contract check to validate the v1 envelope.
+8. Moved `diagnose` and `contract-fixture` under the explicit `debug` namespace.
 
 Next:
 
-1. Move `diagnose` and `contract-fixture` under an explicit `debug` command namespace.
-2. Replace positional JSON for `connect-target` with stdin JSON while keeping a short compatibility window.
-3. Add per-method v1 fixtures and schema checks.
-4. Convert scan JSONL events to include protocol/version or a stream-specific v1 envelope.
-5. Tighten all errors into the frontend error-code set.
-6. Remove deprecated `--json` no-op flags and the `list` compatibility alias.
-7. Re-run formatting, clippy, tests, Shelllist contract checks, and rust-quality-lens after each phase.
+1. Replace positional JSON for `connect-target` with stdin JSON while keeping a short compatibility window.
+2. Add per-method v1 fixtures and schema checks.
+3. Convert scan JSONL events to include protocol/version or a stream-specific v1 envelope.
+4. Tighten all errors into the frontend error-code set.
+5. Remove deprecated `--json` no-op flags and the `list` compatibility alias.
+6. Re-run formatting, clippy, tests, Shelllist contract checks, and rust-quality-lens after each phase.

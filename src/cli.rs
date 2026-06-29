@@ -43,10 +43,18 @@ pub(crate) enum Command {
     Disconnect(JsonOutput),
     /// Check NetworkManager connectivity state.
     Connectivity(JsonOutput),
+    /// Debug and unstable development probes.
+    Debug {
+        #[command(subcommand)]
+        command: DebugCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum DebugCommand {
     /// Compare nm-api's active/cached Wi-Fi data with nmcli.
     Diagnose(JsonOutput),
     /// Print a stable JSON fixture for Shelllist contract tests.
-    #[command(hide = true)]
     ContractFixture,
 }
 
