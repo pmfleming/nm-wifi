@@ -158,6 +158,8 @@ Started:
 15. Reshaped stable commands into grouped namespaces: `wifi ...`, `network ...`, and `debug ...`.
 16. Added `nm-api-connect-parity-probe`, a simple command-line probe that compares `nm-api wifi connect-target` against `nmcli device wifi connect` across visible networks and writes progress plus JSONL/summary logs for review.
 17. Reviewed NetworkManager `nmcli device wifi connect` behavior: nmcli resolves an AP at activation time by SSID/BSSID on the selected Wi-Fi device, then uses AvailableConnections or AddAndActivateConnection with the AP object path. nm-api now re-resolves stale exact AP object paths by SSID+BSSID before falling back, classifies nmcli "not found" failures as `not-found`, and trims post-connect status waiting to reduce command latency.
+18. Made connect waits signal-assisted: nm-api subscribes to NetworkManager device `State`/`ActiveConnection` and Wi-Fi `ActiveAccessPoint` property changes and wakes the activation loop from those signals instead of sleeping through each poll interval.
+19. Moved full network cache refresh after successful connect into a background worker so the response is not blocked by a full list/enrichment refresh.
 
 Next:
 

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -104,6 +105,30 @@ impl Nm {
         self.conn.clone()
     }
 
+    pub(crate) fn spawn_activation_signal_watcher(&self, device_path: String, wake: Sender<()>) {
+        spawn_property_watcher::<u32>(
+            self.connection(),
+            device_path.clone(),
+            DEVICE_IFACE,
+            "State",
+            wake.clone(),
+        );
+        spawn_property_watcher::<OwnedObjectPath>(
+            self.connection(),
+            device_path.clone(),
+            DEVICE_IFACE,
+            "ActiveConnection",
+            wake.clone(),
+        );
+        spawn_property_watcher::<OwnedObjectPath>(
+            self.connection(),
+            device_path,
+            WIFI_IFACE,
+            "ActiveAccessPoint",
+            wake,
+        );
+    }
+
     pub(super) fn proxy<'a>(&'a self, path: &'a str, iface: &'a str) -> Result<Proxy<'a>> {
         Proxy::new(&self.conn, NM_DEST, path, iface).context("create D-Bus proxy")
     }
@@ -115,6 +140,31 @@ impl Nm {
     ) -> Result<Proxy<'a>> {
         self.proxy(path.as_str(), iface)
     }
+}
+
+fn spawn_property_watcher<T>(
+    conn: Connection,
+    path: String,
+    iface: &'static str,
+    property: &'static str,
+    wake: Sender<()>,
+) where
+    T: TryFrom<OwnedValue> + Unpin + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let path_for_log = path.clone();
+        let proxy = match Proxy::new_owned(conn, NM_DEST, path, iface) {
+            Ok(proxy) => proxy,
+            Err(err) => {
+                tracing::debug!(path = %path_for_log, iface, property, error = %format_args!("{err:#}"), "could not create signal watcher proxy");
+                return;
+            }
+        };
+        let mut changes = proxy.receive_property_changed::<T>(property);
+        while changes.next().is_some() {
+            let _ = wake.send(());
+        }
+    });
 }
 
 #[cfg(test)]

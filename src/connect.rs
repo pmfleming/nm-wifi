@@ -1,5 +1,7 @@
 use std::fmt;
 use std::process::Command;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -15,6 +17,7 @@ use crate::nm::Nm;
 const NMCLI_CONNECT_TIMEOUT_SECS: &str = "90";
 const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(90);
 const ACTIVATION_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const ACTIVATION_SIGNAL_WAIT: Duration = Duration::from_secs(5);
 const ACTIVATION_FAILURE_GRACE: Duration = Duration::from_secs(3);
 const POST_CONNECT_STATUS_WAIT: Duration = Duration::from_secs(1);
 
@@ -80,7 +83,7 @@ pub(crate) fn connect_target_with_password(
         Ok(message) => {
             tracing::info!(ssid = %target.ssid, message = %message, "Wi-Fi connection succeeded");
             write_cache_status_best_effort("connected", &message);
-            refresh_cached_networks_best_effort(nm);
+            refresh_cached_networks_background();
             let active_status = cache_active_status_best_effort(nm);
             let connectivity = active_status
                 .as_ref()
@@ -400,8 +403,13 @@ fn unsupported_security_label(security: Option<&str>) -> bool {
 fn wait_for_active_target(nm: &Nm, target: &WifiConnectTarget) -> Result<()> {
     tracing::info!(ssid = %target.ssid, "waiting for target Wi-Fi network to become active");
     let activation_device = nm.wifi_activation_device_for_target(target)?;
+    let signal_rx = activation_device.as_ref().map(|device| {
+        let (tx, rx) = mpsc::channel();
+        nm.spawn_activation_signal_watcher(device.path.to_string(), tx);
+        rx
+    });
     if let Some(device) = activation_device.as_ref() {
-        tracing::debug!(ssid = %target.ssid, iface = %device.iface, device = %device.path, "cached activation device for wait loop");
+        tracing::debug!(ssid = %target.ssid, iface = %device.iface, device = %device.path, "cached activation device for signal-assisted wait loop");
     }
     let deadline = Instant::now() + ACTIVATION_TIMEOUT;
     let mut saw_progress = false;
@@ -448,7 +456,7 @@ fn wait_for_active_target(nm: &Nm, target: &WifiConnectTarget) -> Result<()> {
             );
             last_status = Some(status);
         }
-        sleep(ACTIVATION_POLL_INTERVAL);
+        wait_for_activation_signal(signal_rx.as_ref(), deadline);
     }
     if let Some(status) = last_status {
         return Err(connect_failure(
@@ -572,13 +580,26 @@ fn status_has_network_details(status: &WifiStatus) -> bool {
     })
 }
 
-fn refresh_cached_networks_best_effort(nm: &Nm) {
-    if let Err(err) = refresh_cached_networks(nm) {
-        tracing::warn!(error = %format_args!("{err:#}"), "failed to refresh Wi-Fi cache after connect");
-    }
+fn wait_for_activation_signal(signal_rx: Option<&Receiver<()>>, deadline: Instant) {
+    let Some(signal_rx) = signal_rx else {
+        sleep(ACTIVATION_POLL_INTERVAL);
+        return;
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let wait_for = remaining.min(ACTIVATION_SIGNAL_WAIT);
+    let _ = signal_rx.recv_timeout(wait_for);
 }
 
-fn refresh_cached_networks(nm: &Nm) -> Result<()> {
+fn refresh_cached_networks_background() {
+    thread::spawn(|| {
+        if let Err(err) = refresh_cached_networks() {
+            tracing::warn!(error = %format_args!("{err:#}"), "failed to refresh Wi-Fi cache after connect");
+        }
+    });
+}
+
+fn refresh_cached_networks() -> Result<()> {
+    let nm = Nm::new()?;
     let networks = nm.list_access_points()?;
     cache::write_snapshot(false, &networks)?;
     cache::write_complete(false, networks.len())
