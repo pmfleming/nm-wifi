@@ -152,11 +152,11 @@ Started:
 7. Updated the Shelllist contract check to validate the v1 envelope.
 8. Moved `diagnose` and `contract-fixture` under the explicit `debug` namespace.
 9. Added stdin request JSON for `connect-target` and updated Shelllist to send targets/secrets through that transport; positional target JSON remains temporarily compatible.
+10. Added `protocol`, `version`, and `stream` metadata to scan JSONL events.
 
 Next:
 
 1. Add per-method v1 fixtures and schema checks.
-2. Convert scan JSONL events to include protocol/version or a stream-specific v1 envelope.
-3. Tighten all errors into the frontend error-code set.
-4. Remove deprecated positional `connect-target <target-json>`, `--json` no-op flags, and the `list` compatibility alias.
-5. Re-run formatting, clippy, tests, Shelllist contract checks, and rust-quality-lens after each phase.
+2. Tighten all errors into the frontend error-code set.
+3. Remove deprecated positional `connect-target <target-json>`, `--json` no-op flags, and the `list` compatibility alias.
+4. Re-run formatting, clippy, tests, Shelllist contract checks, and rust-quality-lens after each phase.

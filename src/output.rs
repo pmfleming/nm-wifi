@@ -151,9 +151,16 @@ fn print_pretty_json<T: Serialize + ?Sized>(value: &T, context: &'static str) ->
 }
 
 pub(crate) fn emit_stream_event(event: &StreamOutput<'_>) -> Result<()> {
+    let mut value = serde_json::to_value(event).context("serialize JSON stream event")?;
+    if let Value::Object(object) = &mut value {
+        object.insert("protocol".to_string(), json!(API_PROTOCOL));
+        object.insert("version".to_string(), json!(API_VERSION));
+        object.insert("stream".to_string(), json!("wifi-scan"));
+    }
+
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    serde_json::to_writer(&mut stdout, event).context("write JSON event")?;
+    serde_json::to_writer(&mut stdout, &value).context("write JSON event")?;
     stdout.write_all(b"\n").context("write JSON newline")?;
     stdout.flush().context("flush JSON event")?;
     Ok(())

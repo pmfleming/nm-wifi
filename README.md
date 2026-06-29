@@ -4,7 +4,9 @@ Local JSON/JSONL NetworkManager adapter for Shelllist and similar frontends.
 
 `nm-api` is not a human Wi-Fi menu. It exposes a frontend-facing protocol over a command transport while Shelllist owns UI, prompts, forms, and presentation.
 
-Stable responses use protocol envelope v1:
+Stable responses use protocol envelope v1. Scan JSONL events include the same `protocol` and `version` metadata plus `stream: "wifi-scan"`.
+
+Response envelope:
 
 ```json
 {
