@@ -152,9 +152,11 @@ Started:
 9. Added stdin request JSON for `connect-target` and updated Shelllist to send targets/secrets through that transport; positional target JSON remains temporarily compatible.
 10. Added `protocol`, `version`, and `stream` metadata to scan JSONL events.
 11. Removed stable `--json` no-op flags, the `list` compatibility alias, and positional `connect-target <target-json>`.
+12. Added per-method v1 fixture output and Shelllist schema checks for network/status/connect/scan/profile shapes.
+13. Added top-level typed JSON error envelopes for unhandled command failures while avoiding duplicate connect-error reports.
+14. Re-ran rust-quality-lens `measure all` successfully.
 
 Next:
 
-1. Add per-method v1 fixtures and schema checks.
-2. Tighten all errors into the frontend error-code set.
-3. Re-run formatting, clippy, tests, Shelllist contract checks, and rust-quality-lens after each phase.
+1. Consider reshaping flat commands into grouped namespaces such as `wifi networks` and `debug ...` if/when the API grows beyond Wi-Fi.
+2. Expand request schemas beyond `connect-target` as new NetworkManager surfaces are added.

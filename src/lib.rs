@@ -14,4 +14,4 @@ mod stream;
 mod stream_emit;
 mod stream_watch;
 
-pub use app::run;
+pub use app::{report_error, run};

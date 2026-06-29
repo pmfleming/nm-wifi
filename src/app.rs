@@ -47,6 +47,51 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+pub fn report_error(err: &anyhow::Error) {
+    if crate::output::is_reported_error(err) {
+        return;
+    }
+
+    let message = format!("{err:#}");
+    let code = classify_error(&message);
+    if let Err(report_err) = crate::output::print_api_error(code, &message) {
+        eprintln!("Error: {err:#}");
+        eprintln!("Also failed to serialize nm-api error response: {report_err:#}");
+    }
+}
+
+fn classify_error(message: &str) -> &'static str {
+    let lower = message.to_lowercase();
+    if lower.contains("networkmanager")
+        || lower.contains("network manager")
+        || lower.contains("d-bus")
+        || lower.contains("dbus")
+    {
+        return "networkmanager-unavailable";
+    }
+    if lower.contains("parse")
+        || lower.contains("invalid")
+        || lower.contains("requires")
+        || lower.contains("validation")
+        || lower.contains("bad")
+    {
+        return "validation-error";
+    }
+    if lower.contains("permission")
+        || lower.contains("authorization")
+        || lower.contains("not authorized")
+    {
+        return "authorization-required";
+    }
+    if lower.contains("not found") || lower.contains("no such") {
+        return "not-found";
+    }
+    if lower.contains("timeout") || lower.contains("timed out") {
+        return "timeout";
+    }
+    "internal-error"
+}
+
 fn with_nm<T>(f: impl FnOnce(&Nm) -> Result<T>) -> Result<T> {
     let nm = Nm::new()?;
     f(&nm)

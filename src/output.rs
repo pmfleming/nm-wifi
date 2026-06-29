@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io::{self, Write};
 
 use anyhow::{Context, Result};
@@ -11,6 +12,25 @@ use crate::model::{
 
 pub(crate) const API_PROTOCOL: &str = "nm-api";
 pub(crate) const API_VERSION: u32 = 1;
+
+#[derive(Debug)]
+struct ApiErrorAlreadyReported;
+
+impl fmt::Display for ApiErrorAlreadyReported {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("API error already reported")
+    }
+}
+
+impl std::error::Error for ApiErrorAlreadyReported {}
+
+pub(crate) fn reported_error() -> anyhow::Error {
+    anyhow::Error::new(ApiErrorAlreadyReported)
+}
+
+pub(crate) fn is_reported_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<ApiErrorAlreadyReported>().is_some()
+}
 
 #[derive(Serialize)]
 #[serde(tag = "event", rename_all = "kebab-case")]
@@ -89,6 +109,21 @@ pub(crate) fn print_wifi_share_payload(payload: &WifiSharePayload) -> Result<()>
 
 pub(crate) fn print_disconnect_result(result: &DisconnectResult) -> Result<()> {
     print_api_data("result", result, "serialize disconnect response JSON")
+}
+
+pub(crate) fn print_api_error(code: &str, message: &str) -> Result<()> {
+    let envelope = json!({
+        "protocol": API_PROTOCOL,
+        "version": API_VERSION,
+        "ok": false,
+        "error": {
+            "code": code,
+            "message": message,
+            "details": {},
+        },
+        "data": {},
+    });
+    print_pretty_json(&envelope, "serialize API error response JSON")
 }
 
 pub(crate) fn print_api_message(message: &str) -> Result<()> {

@@ -17,7 +17,7 @@ Response envelope:
 }
 ```
 
-Failures use typed errors:
+Failures, including top-level command failures, use typed errors:
 
 ```json
 {

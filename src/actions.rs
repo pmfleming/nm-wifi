@@ -1,7 +1,7 @@
 use std::io::{self, BufRead, Read};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 
 use crate::cli::{ConnectOptions, ConnectTargetOptions, ProfileCommand, ScanOptions};
 use crate::connect;
@@ -58,7 +58,8 @@ fn print_connect_attempt(
         Err(err) => {
             let result = connect_error(target, &err);
             print_connect_result(&result)?;
-            Err(anyhow!("Wi-Fi connection failed: {}", result.message))
+            tracing::debug!(message = %result.message, "connect error response emitted");
+            Err(crate::output::reported_error())
         }
     }
 }
